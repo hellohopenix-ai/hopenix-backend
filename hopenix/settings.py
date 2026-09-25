@@ -83,6 +83,8 @@ INSTALLED_APPS = [
     'reports',
     'visitors',
     'coworking',
+       'cloudinary_storage',
+    'cloudinary',
 ]
 
 MIDDLEWARE = [
@@ -286,3 +288,9 @@ VAPID_CLAIMS = {'sub': 'mailto:you@example.com'}  # replace with a real contact 
 ACTIVITY_LOG_TRUST_PROXY_HEADERS = config('ACTIVITY_LOG_TRUST_PROXY_HEADERS', default=False, cast=bool)
 # Extra URL regexes the request-level fallback logger should ignore (noisy endpoints).
 ACTIVITY_LOG_IGNORE_PATHS = []
+CLOUDINARY_STORAGE = {
+    'CLOUD_NAME': config('CLOUDINARY_CLOUD_NAME', default=''),
+    'API_KEY': config('CLOUDINARY_API_KEY', default=''),
+    'API_SECRET': config('CLOUDINARY_API_SECRET', default=''),
+}
+DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
