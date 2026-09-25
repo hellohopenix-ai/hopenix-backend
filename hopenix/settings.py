@@ -293,4 +293,15 @@ CLOUDINARY_STORAGE = {
     'API_KEY': config('CLOUDINARY_API_KEY', default=''),
     'API_SECRET': config('CLOUDINARY_API_SECRET', default=''),
 }
-DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
+# Django 5+/6+ replaced the old DEFAULT_FILE_STORAGE setting with this
+# STORAGES dict — DEFAULT_FILE_STORAGE alone is silently ignored on
+# Django 6.1, which is why avatars kept saving to local disk on Railway
+# even after Cloudinary env vars were set.
+STORAGES = {
+    "default": {
+        "BACKEND": "cloudinary_storage.storage.MediaCloudinaryStorage",
+    },
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
