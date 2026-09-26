@@ -38,6 +38,7 @@ PATH_TO_MODULE = {
     "meetings": "Meetings",
     "employees": "Employees",
     "reports": "Reports",
+    "coworking": "Coworking",
 }
 
 # Actions a browser is allowed to report through POST /activity/track/.

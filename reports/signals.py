@@ -296,6 +296,13 @@ TRACKED = {
     "settings.IncomeSettings": Track("Settings", "income settings", repr=lambda o: "Income", events=("update",)),
     "settings.ExpenseSettings": Track("Settings", "expense settings", repr=lambda o: "Expenses", events=("update",)),
     "settings.SalesSettings": Track("Settings", "sales settings", repr=lambda o: "Sales", events=("update",)),
+    # ---- coworking
+    "coworking.CoworkingApplication": Track(
+        "Coworking", "coworking application",
+        repr=lambda o: o.code or o.full_name,
+        summary=("chairs", "seating", "access"),
+        exclude=("cnic", "cnic_front", "cnic_back", "photo"),
+    ),
     # ---- reports (the daily-report CREATE is logged by the view, once its files are attached)
     "reports.DailyReport": Track("Reports", "daily report", repr=lambda o: f"{o.date} — {o.project or 'No project'}",
                                  project="project", events=("update", "delete"), describe=_describe_daily_report),

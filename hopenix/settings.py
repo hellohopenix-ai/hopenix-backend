@@ -298,22 +298,32 @@ CLOUDINARY_STORAGE = {
 # Django 6.1, which is why avatars kept saving to local disk on Railway
 # even after Cloudinary env vars were set.
 #
-# CONDITIONAL, not hardcoded to Cloudinary: only switch to Cloudinary when
-# real credentials are actually configured (production/Railway, where
-# CLOUDINARY_CLOUD_NAME etc. are set as env vars). Without this guard,
-# every environment without Cloudinary creds -- a teammate's laptop, CI,
-# `manage.py test` -- would try to call Cloudinary's API for every file
-# upload (avatars, Daily Report photos/videos, Coworking documents) and
-# crash with "Must supply api_key", even though Django's local
-# FileSystemStorage would have worked fine for local/dev/test use.
-USE_CLOUDINARY = bool(CLOUDINARY_STORAGE['CLOUD_NAME'])
+# CONDITIONAL, not hardcoded to Cloudinary: only switch to Cloudinary in
+# production (DEBUG=False, e.g. Railway). This is keyed off DEBUG rather
+# than "is a cloud name present", because a developer's local .env may
+# well have real, valid Cloudinary credentials (for occasionally testing
+# cloud storage by hand) -- but `manage.py test` uploads tiny fake/dummy
+# image bytes that Cloudinary's real API rejects ("Invalid image file"),
+# even though Django's local FileSystemStorage doesn't care and just
+# writes the bytes to disk. Keying off DEBUG keeps local/test runs on
+# FileSystemStorage regardless of what's in .env, while still using
+# Cloudinary in production where DEBUG is always False.
+USE_CLOUDINARY = not DEBUG
 STORAGES = {
     "default": (
         {"BACKEND": "cloudinary_storage.storage.MediaCloudinaryStorage"}
         if USE_CLOUDINARY
         else {"BACKEND": "django.core.files.storage.FileSystemStorage"}
     ),
-    "staticfiles": {
-        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
-    },
+    "staticfiles": (
+        # The Manifest variant needs staticfiles.json, which only exists
+        # after `collectstatic` has run (Railway's pre-deploy command does
+        # this in production). Locally/in tests nobody runs collectstatic
+        # first, so any template using {% static %} (e.g. Django admin)
+        # would crash with "Missing staticfiles manifest entry" without
+        # this DEBUG-based fallback to the plain, non-manifest variant.
+        {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"}
+        if not DEBUG
+        else {"BACKEND": "whitenoise.storage.CompressedStaticFilesStorage"}
+    ),
 }
