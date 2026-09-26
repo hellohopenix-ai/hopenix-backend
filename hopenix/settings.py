@@ -280,7 +280,7 @@ SUPPORT_EMAIL = config('SUPPORT_EMAIL', default='')
 # the PRIVATE key here only (add both to your .env, same as DB_* above).
 VAPID_PUBLIC_KEY = config('VAPID_PUBLIC_KEY', default='')
 VAPID_PRIVATE_KEY = config('VAPID_PRIVATE_KEY', default='')
-VAPID_CLAIMS = {'sub': 'mailto:you@example.com'}  # replace with a real contact address
+VAPID_CLAIMS = {'sub': 'mailto:' + (SUPPORT_EMAIL or config('EMAIL_HOST_USER', default='admin@example.com'))}
 
 # Reports / activity log (see reports/).
 # Set True only if you run behind a proxy (nginx etc.) that sets X-Forwarded-For; otherwise
