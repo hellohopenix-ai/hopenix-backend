@@ -297,10 +297,22 @@ CLOUDINARY_STORAGE = {
 # STORAGES dict — DEFAULT_FILE_STORAGE alone is silently ignored on
 # Django 6.1, which is why avatars kept saving to local disk on Railway
 # even after Cloudinary env vars were set.
+#
+# CONDITIONAL, not hardcoded to Cloudinary: only switch to Cloudinary when
+# real credentials are actually configured (production/Railway, where
+# CLOUDINARY_CLOUD_NAME etc. are set as env vars). Without this guard,
+# every environment without Cloudinary creds -- a teammate's laptop, CI,
+# `manage.py test` -- would try to call Cloudinary's API for every file
+# upload (avatars, Daily Report photos/videos, Coworking documents) and
+# crash with "Must supply api_key", even though Django's local
+# FileSystemStorage would have worked fine for local/dev/test use.
+USE_CLOUDINARY = bool(CLOUDINARY_STORAGE['CLOUD_NAME'])
 STORAGES = {
-    "default": {
-        "BACKEND": "cloudinary_storage.storage.MediaCloudinaryStorage",
-    },
+    "default": (
+        {"BACKEND": "cloudinary_storage.storage.MediaCloudinaryStorage"}
+        if USE_CLOUDINARY
+        else {"BACKEND": "django.core.files.storage.FileSystemStorage"}
+    ),
     "staticfiles": {
         "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
     },
