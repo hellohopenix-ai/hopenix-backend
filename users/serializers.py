@@ -6,6 +6,7 @@ from rest_framework import serializers
 from .models import (
     Profile,
     RolePermission,
+    RoleCatalogEntry,
     ModulePermission,
     UserAccessOverride,
     UserSubPageAccess,
@@ -265,6 +266,13 @@ class RolePermissionSerializer(serializers.ModelSerializer):
     class Meta:
         model = RolePermission
         fields = ["role", "pages"]
+
+
+class RoleCatalogEntrySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RoleCatalogEntry
+        fields = ["id", "name", "tag", "access", "locked"]
+        read_only_fields = ["id", "locked"]
 
 
 class ModulePermissionSerializer(serializers.ModelSerializer):

@@ -428,9 +428,10 @@ class AdminUpdateProfileView(APIView):
 # UserPage.jsx access control — Page Access Control / Module Access
 # Control / Individual User Access / AI Assistant toggle
 # ---------------------------------------------------------------------------
-from .models import RolePermission, ModulePermission, UserAccessOverride, UserSubPageAccess, AppSetting
+from .models import RolePermission, RoleCatalogEntry, ModulePermission, UserAccessOverride, UserSubPageAccess, AppSetting
 from .serializers import (
     RolePermissionSerializer,
+    RoleCatalogEntrySerializer,
     ModulePermissionSerializer,
     UserAccessOverrideSerializer,
     UserSubPageAccessSerializer,
@@ -461,6 +462,44 @@ class RolePermissionsView(APIView):
 
         obj, _ = RolePermission.objects.update_or_create(role=role, defaults={"pages": pages})
         return Response({obj.role: obj.pages})
+
+
+class RoleCatalogView(APIView):
+    """GET /api/auth/role-catalog/  -> [{id, name, tag, access, locked}, ...]
+    POST /api/auth/role-catalog/  { name, tag?, access? } -> creates one entry
+    DELETE /api/auth/role-catalog/<id>/  -> deletes one entry (locked ones rejected)
+    Backs UserPage.jsx's "Role Management" card — the org's directory of
+    role labels. Used to be localStorage-only (userpage_roles_v1), so a
+    role added by one admin, on one browser, was invisible to everyone
+    else and gone after clearing site data."""
+
+    permission_classes = [IsAdmin]
+
+    def get(self, request):
+        entries = RoleCatalogEntry.objects.all()
+        return Response(RoleCatalogEntrySerializer(entries, many=True).data)
+
+    def post(self, request):
+        name = (request.data.get("name") or "").strip()
+        if not name:
+            return Response({"error": "A role name is required."}, status=status.HTTP_400_BAD_REQUEST)
+        if RoleCatalogEntry.objects.filter(name__iexact=name).exists():
+            return Response({"error": "A role with this name already exists."}, status=status.HTTP_400_BAD_REQUEST)
+        entry = RoleCatalogEntry.objects.create(
+            name=name,
+            tag=(request.data.get("tag") or "").strip(),
+            access=(request.data.get("access") or "Custom Access").strip(),
+        )
+        return Response(RoleCatalogEntrySerializer(entry).data, status=status.HTTP_201_CREATED)
+
+    def delete(self, request, entry_id=None):
+        entry = RoleCatalogEntry.objects.filter(id=entry_id).first()
+        if not entry:
+            return Response({"error": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        if entry.locked:
+            return Response({"error": "This role can't be deleted."}, status=status.HTTP_400_BAD_REQUEST)
+        entry.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class ModulePermissionsView(APIView):

@@ -300,6 +300,32 @@ class RolePermission(models.Model):
         return f"{self.role} -> {len(self.pages)} page(s)"
 
 
+class RoleCatalogEntry(models.Model):
+    """UserPage.jsx's "Role Management" card — the free-text directory of
+    role labels (e.g. "Manager", "Digital Marketing Executive") an admin
+    can add or remove, each with a display tag/access-level label. This
+    is separate from RolePermission above (which enforces actual
+    per-role page access) — it's just the org's role directory, and used
+    to be kept only in this one browser's localStorage, so a role added
+    on one device/browser was invisible everywhere else.
+
+    `locked` entries (e.g. "Super Admin") can't be deleted — enforced
+    server-side in RoleCatalogView, not just hidden in the UI."""
+
+    name = models.CharField(max_length=100, unique=True)
+    tag = models.CharField(max_length=50, blank=True, default="")
+    access = models.CharField(max_length=50, blank=True, default="")
+    locked = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return self.name
+
+
+
 class ModulePermission(models.Model):
     """CRUD-level access control per role, per named module/page —
     UserPage.jsx's "Module Access Control" table. Field names match the

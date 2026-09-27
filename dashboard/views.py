@@ -33,6 +33,11 @@ from expenses.models import Expense as RealExpense, ExpenseStatus
 # not sales/deals logged — those two numbers will legitimately differ
 # whenever a sale hasn't been paid yet).
 from sales.models import Sale
+# Real front-desk check-ins (VisitorsPage.jsx) live in the separate
+# `visitors` app — used below to back the Dashboard Statistics card's
+# second metric, which used to be 100% mock data regardless of what was
+# actually happening at the front desk.
+from visitors.models import Visitor
 from users.access import can_perform, role_category
 from users.throttles import PortalLoginRateThrottle, PortalEmailKeyedThrottle
 from reports.services import log_activity as audit_log  # Reports-page audit trail (never raises)
@@ -376,6 +381,80 @@ class CustomerSatisfactionView(APIView):
                 "note": "Customer satisfaction increases every week"
                 if period == "weekly"
                 else f"Order approval rate — {period}",
+                "bars": bars,
+            }
+        )
+
+
+class VisitorTrafficView(APIView):
+    """GET /api/dashboard/visitor-traffic/?period=weekly|monthly|yearly
+    Real front-desk check-in counts (visitors.Visitor, created whenever
+    someone is registered on VisitorsPage.jsx) per bucket. Feeds the
+    Dashboard Statistics card's second metric — this used to be labelled
+    "Visitor height" and was 100% hardcoded mock data with no backend
+    endpoint at all; renamed to "Visitor Traffic" to actually describe
+    what it now measures (front-desk visits, not literal height).
+    Same bucket/shape convention as CustomerSatisfactionView above so the
+    frontend's existing Statistics-card rendering works unchanged."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        _deny_clients(request.user)
+        period = request.query_params.get("period", "weekly").lower()
+        now = timezone.now()
+
+        if period == "yearly":
+            visitors = Visitor.objects.filter(created_at__year=now.year).values_list(
+                "created_at", flat=True
+            )
+            labels = ["Q1", "Q2", "Q3", "Q4"]
+            n_buckets = 4
+
+            def bucket_of(created_at):
+                return (created_at.month - 1) // 3
+
+        elif period == "monthly":
+            visitors = Visitor.objects.filter(
+                created_at__year=now.year, created_at__month=now.month
+            ).values_list("created_at", flat=True)
+            labels = ["Week 1", "Week 2", "Week 3", "Week 4"]
+            n_buckets = 4
+
+            def bucket_of(created_at):
+                return min((created_at.day - 1) // 7, 3)
+
+        else:  # weekly
+            visitors = Visitor.objects.filter(created_at__gte=now - timedelta(days=90)).values_list(
+                "created_at", flat=True
+            )
+            labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+            n_buckets = 7
+
+            def bucket_of(created_at):
+                return created_at.weekday()
+
+        counts = {i: 0 for i in range(n_buckets)}
+        for created_at in visitors:
+            counts[bucket_of(created_at)] += 1
+
+        max_count = max(counts.values()) if counts else 0
+        bars = []
+        for i, label in enumerate(labels):
+            c = counts[i]
+            # Scaled 0-100 against the busiest bucket so the bar chart
+            # reads the same way the other Statistics metric does, since
+            # a raw headcount doesn't map onto a fixed 0-100 bar height.
+            value = round((c / max_count) * 100) if max_count else 0
+            bars.append({"day": label, "value": value, "delta": f"{c}"})
+
+        total = sum(counts.values())
+        period_word = {"weekly": "week", "monthly": "month", "yearly": "year"}.get(period, period)
+
+        return Response(
+            {
+                "headline": f"{total}",
+                "note": f"{total} visitor check-ins this {period_word}",
                 "bars": bars,
             }
         )
