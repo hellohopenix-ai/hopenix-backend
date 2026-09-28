@@ -79,6 +79,15 @@ class Task(models.Model):
     role_template = models.CharField(max_length=100, blank=True)
     requires_link = models.BooleanField(default=False)
     from_client_module = models.BooleanField(default=False)
+    # Identity of the Clients-page module/sub-module (and the "new client
+    # assigned" task) this task was generated from. These used to live only
+    # in one browser's localStorage (taskspage_task_link_meta_v1), so on
+    # another browser/device the auto-task sync couldn't tell a task already
+    # existed for that module and created duplicates. Kept as plain strings
+    # because the Clients page ids look like "mod-0-1712345678".
+    client_module_id = models.CharField(max_length=100, blank=True, default="")
+    sub_module_id = models.CharField(max_length=100, blank=True, default="")
+    from_client_assignment = models.BooleanField(default=False)
 
     # FIX: direct FK to the real projects.Module this task belongs to.
     # Null for tasks that pre-date this fix or have no module. Used by

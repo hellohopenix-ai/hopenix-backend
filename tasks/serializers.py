@@ -85,6 +85,18 @@ class TaskSerializer(serializers.ModelSerializer):
     roleTemplate = serializers.CharField(source="role_template", required=False, allow_blank=True)
     requiresLink = serializers.BooleanField(source="requires_link", required=False)
     fromClientModule = serializers.BooleanField(source="from_client_module", required=False)
+    moduleId = serializers.CharField(source="client_module_id", required=False, allow_blank=True, allow_null=True)
+    subModuleId = serializers.CharField(source="sub_module_id", required=False, allow_blank=True, allow_null=True)
+    fromClientAssignment = serializers.BooleanField(source="from_client_assignment", required=False)
+
+    # The frontend sends null for "no sub-module"; the columns are NOT NULL
+    # strings, so store that as "" (and read it back as "" — the page already
+    # treats "" and null the same via `(x || null)`).
+    def validate_moduleId(self, value):
+        return value or ""
+
+    def validate_subModuleId(self, value):
+        return value or ""
 
     # FIX: expose the real backend Module pk as moduleBackendId so the
     # frontend can stamp it on auto-created tasks and later drive
@@ -114,6 +126,7 @@ class TaskSerializer(serializers.ModelSerializer):
             "attachment", "attachments", "sampleFiles", "subtasks",
             "moduleName", "moduleProjectName", "moduleTaskKey",
             "roleTemplate", "requiresLink", "fromClientModule",
+            "moduleId", "subModuleId", "fromClientAssignment",
             "moduleBackendId", "moduleProjectBackendId",
         ]
 
