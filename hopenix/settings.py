@@ -8,13 +8,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # SECRET_KEY and DEBUG now come from .env instead of being hardcoded, so
 # the real production key never sits in source control. Generate one with:
 #   python -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
-# and put it in .env as SECRET_KEY=... . The fallback below is ONLY so the
-# project still boots for local dev if you haven't set one yet — replace
-# it before deploying anywhere real.
-SECRET_KEY = config(
-    'SECRET_KEY',
-    default='django-insecure-ymce#b*dw)74p7fb*4nty3wyj9h5tp@j%7gy5spqj+u3a@8ow4',
-)
+# and put it in .env (local) or in your host's environment variables
+# (Railway) as SECRET_KEY=... . There is deliberately NO fallback: if the
+# key is missing the app refuses to start, instead of silently running
+# with a publicly-known key.
+SECRET_KEY = config('SECRET_KEY')
 DEBUG = config('DEBUG', default=False, cast=bool)
 ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1', cast=Csv())
 
