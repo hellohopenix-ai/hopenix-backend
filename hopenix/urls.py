@@ -18,6 +18,7 @@ urlpatterns = [
     path('api/reports/', include('reports.urls')),
    path('api/visitors/', include('visitors.urls')),
        path('api/coworking/', include('coworking.urls')),
+          path('api/flags/', include('userflags.urls')),
 ]
 
 # Serve uploaded files (CVs, etc.) in development. In production this

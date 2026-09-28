@@ -83,6 +83,7 @@ INSTALLED_APPS = [
     'coworking',
        'cloudinary_storage',
     'cloudinary',
+       'userflags',
 ]
 
 MIDDLEWARE = [
