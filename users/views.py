@@ -635,6 +635,55 @@ class UserSubPageAccessView(APIView):
         return Response(UserSubPageAccessSerializer(row).data)
 
 
+class MyAccessView(APIView):
+    """GET /api/auth/my-access/  (ANY logged-in user)
+        -> {
+             "category":   "employee",              # role bucket used for lookups
+             "rolePages":  [...] | null,            # role's Page Access row (null = never saved, use defaults)
+             "modules":    {"Tasks": {view,create,edit,delete}, ...},   # saved rows for the role
+             "override":   {"mode", "pages"} | null,  # this user's Individual Access override
+             "subAccess":  {"Settings": "full", ...}, # this user's sub-page "full" grants
+           }
+
+    FIX (custom/full access set by admin never showed up on the user's own
+    device): role-permissions / module-permissions / access-override /
+    sub-access are all admin-only endpoints, and the frontend only loads
+    them for admin sessions. Every other user therefore only ever saw the
+    hard-coded defaults (or whatever old data their own browser's
+    localStorage held), no matter what the admin granted. This read-only
+    endpoint hands every user just THEIR OWN resolved access, so it applies
+    on any browser/device. It never exposes anyone else's data."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        from users.access import role_category
+
+        user = request.user
+        category = role_category(getattr(user, "role", None))
+
+        role_row = RolePermission.objects.filter(role=category).first()
+        modules = {
+            mp.module: {"view": mp.view, "create": mp.create, "edit": mp.edit, "delete": mp.delete}
+            for mp in ModulePermission.objects.filter(role=category)
+        }
+        override = UserAccessOverride.objects.filter(user_id=user.pk).first()
+        sub = {
+            row.page: row.mode
+            for row in UserSubPageAccess.objects.filter(user_id=user.pk)
+            if row.mode == "full"
+        }
+        return Response(
+            {
+                "category": category,
+                "rolePages": list(role_row.pages or []) if role_row is not None else None,
+                "modules": modules,
+                "override": UserAccessOverrideSerializer(override).data if override else None,
+                "subAccess": sub,
+            }
+        )
+
+
 class AiAssistantSettingView(APIView):
     """GET /api/auth/settings/ai-assistant/  -> {enabled}
     PUT /api/auth/settings/ai-assistant/  { enabled }

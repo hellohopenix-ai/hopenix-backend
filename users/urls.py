@@ -21,6 +21,7 @@ urlpatterns = [
     path('users/<int:user_id>/assign-manager/', views.AssignManagerView.as_view(), name='assign-manager'),
     path('users/<int:user_id>/access-override/', views.UserAccessOverrideView.as_view(), name='user-access-override'),
     path('users/<int:user_id>/sub-access/<str:page>/', views.UserSubPageAccessView.as_view(), name='user-sub-access'),
+    path('my-access/', views.MyAccessView.as_view(), name='my-access'),
     path('role-permissions/', views.RolePermissionsView.as_view(), name='role-permissions'),
     path('role-catalog/', views.RoleCatalogView.as_view(), name='role-catalog'),
     path('role-catalog/<int:entry_id>/', views.RoleCatalogView.as_view(), name='role-catalog-detail'),
