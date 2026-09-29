@@ -12,7 +12,7 @@ from channels.layers import get_channel_layer
 from .consumers import is_user_online, user_group_name
 from .models import Call, Conversation, Message, MessageReaction, Participant, PushSubscription
 from .permissions import can_message, get_allowed_contact_ids, get_allowed_contacts
-from .push_utils import send_incoming_call_push
+from .push_utils import send_incoming_call_push, send_new_message_push
 from .serializers import CallSerializer, ContactSerializer, ConversationListSerializer, MessageSerializer
 
 User = get_user_model()
@@ -196,6 +196,16 @@ class SendMessageView(APIView):
             "sender_id": request.user.id, "recipient_id": recipient.id,
             "message": message_data,
         })
+
+        # The websocket push above only reaches the recipient if their tab
+        # is actually open right now. If it isn't — site closed, browser
+        # closed, phone locked — is_user_online(recipient.id) is False and
+        # they'd otherwise never know a message arrived until they happen
+        # to open the app again. Web Push (same mechanism CallStartView
+        # already uses for calls) wakes their device with an OS-level
+        # notification even with nothing running, like WhatsApp does.
+        if not is_user_online(recipient.id):
+            send_new_message_push(recipient, message_data, request.user.name)
 
         return Response(message_data, status=status.HTTP_201_CREATED)
 

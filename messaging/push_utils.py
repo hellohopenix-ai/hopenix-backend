@@ -59,3 +59,36 @@ def send_incoming_call_push(callee, call_data, caller_name):
         "title": f"Incoming call from {caller_name}",
         "body": "Audio call" if call_data.get("callType") == "audio" else "Video call",
     })
+
+
+def send_new_message_push(recipient, message_data, sender_name):
+    """Convenience wrapper for SendMessageView — shapes the payload the
+    service worker expects for a new-message notification, the same way
+    send_incoming_call_push does for calls. Only called when the recipient
+    isn't currently connected over the live websocket (see is_user_online
+    in views.py), so an open, focused chat never gets a redundant OS
+    notification on top of the message just appearing.
+
+    The body is a short preview — the message text itself for a text
+    message, or a generic "Sent a photo/voice message/file" line for
+    anything else, so a peeked lock-screen notification never leaks a
+    file's contents, only that one arrived."""
+    kind = message_data.get("kind")
+    if kind == "image":
+        body = "📷 Sent a photo"
+    elif kind == "voice":
+        body = "🎤 Sent a voice message"
+    elif kind == "file":
+        name = message_data.get("attachmentName") or "a file"
+        body = f"📎 Sent {name}"
+    else:
+        text = (message_data.get("text") or "").strip()
+        body = (text[:120] + "…") if len(text) > 120 else (text or "Sent a message")
+
+    send_web_push(recipient, {
+        "type": "message.new",
+        "senderId": message_data.get("senderId"),
+        "conversationId": message_data.get("conversation_id"),
+        "title": sender_name,
+        "body": body,
+    })
