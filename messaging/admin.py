@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Call, Conversation, Participant, Message
+from .models import Call, Conversation, Participant, Message, MessageReaction
 
 @admin.register(Conversation)
 class ConversationAdmin(admin.ModelAdmin):
@@ -12,6 +12,10 @@ class ParticipantAdmin(admin.ModelAdmin):
 @admin.register(Message)
 class MessageAdmin(admin.ModelAdmin):
     list_display = ("id", "conversation", "sender", "recipient", "kind", "text", "is_read", "created_at")
+
+@admin.register(MessageReaction)
+class MessageReactionAdmin(admin.ModelAdmin):
+    list_display = ("id", "message", "user", "emoji", "created_at")
 
 @admin.register(Call)
 class CallAdmin(admin.ModelAdmin):

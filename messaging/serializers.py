@@ -59,18 +59,57 @@ class MessageSerializer(serializers.ModelSerializer):
     voiceDuration = serializers.IntegerField(source="voice_duration_seconds", read_only=True)
     createdAt = serializers.DateTimeField(source="created_at", read_only=True)
     is_read = serializers.BooleanField(read_only=True)
+    replyTo = serializers.SerializerMethodField()
+    reactions = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
         fields = [
             "id", "conversation_id", "senderId", "senderName", "recipientId", "recipientName",
             "kind", "text", "attachmentUrl", "attachmentName", "attachmentSize", "isImage",
-            "voiceDuration", "createdAt", "isMine", "is_read", "is_deleted",
+            "voiceDuration", "createdAt", "isMine", "is_read", "is_deleted", "replyTo", "reactions",
         ]
 
     def get_isMine(self, obj):
         request = self.context.get("request")
         return bool(request and obj.sender_id == request.user.id)
+
+    def get_replyTo(self, obj):
+        """A short quote of the message this one replies to (WhatsApp-style),
+        or None if it isn't a reply. Kept intentionally thin — just enough
+        for the little quoted preview above the bubble, not the full
+        message — so this never needs its own recursive serializer."""
+        parent = obj.reply_to
+        if not parent:
+            return None
+        if parent.is_deleted:
+            return {
+                "id": parent.id, "senderId": parent.sender_id, "senderName": parent.sender.name,
+                "text": "", "kind": parent.kind, "attachmentName": "", "deleted": True,
+            }
+        return {
+            "id": parent.id,
+            "senderId": parent.sender_id,
+            "senderName": parent.sender.name,
+            "text": parent.text,
+            "kind": parent.kind,
+            "attachmentName": parent.attachment_name,
+            "deleted": False,
+        }
+
+    def get_reactions(self, obj):
+        """Emoji reactions grouped like WhatsApp/Slack show them: one chip
+        per distinct emoji with a count, plus whether the current viewer is
+        one of the reactors (so the frontend can highlight/toggle it)."""
+        request = self.context.get("request")
+        viewer_id = request.user.id if request else None
+        grouped = {}
+        for r in obj.reactions.all():
+            entry = grouped.setdefault(r.emoji, {"emoji": r.emoji, "count": 0, "reactedByMe": False})
+            entry["count"] += 1
+            if viewer_id and r.user_id == viewer_id:
+                entry["reactedByMe"] = True
+        return list(grouped.values())
 
     def get_attachmentUrl(self, obj):
         if not obj.attachment:

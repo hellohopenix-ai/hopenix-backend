@@ -7,6 +7,7 @@ urlpatterns = [
     path("thread/<int:user_id>/", views.ThreadMessagesView.as_view(), name="msg-thread"),
     path("thread/<int:user_id>/read/", views.MarkThreadReadView.as_view(), name="msg-thread-read"),
     path("send/", views.SendMessageView.as_view(), name="msg-send"),
+    path("messages/<int:message_id>/react/", views.MessageReactView.as_view(), name="msg-react"),
 
     # Calls (audio/video, signalled over the same per-user websocket
     # messages already use — see messaging/consumers.py + views.py).

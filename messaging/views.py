@@ -10,7 +10,7 @@ from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 
 from .consumers import is_user_online, user_group_name
-from .models import Call, Conversation, Message, Participant, PushSubscription
+from .models import Call, Conversation, Message, MessageReaction, Participant, PushSubscription
 from .permissions import can_message, get_allowed_contact_ids, get_allowed_contacts
 from .push_utils import send_incoming_call_push
 from .serializers import CallSerializer, ContactSerializer, ConversationListSerializer, MessageSerializer
@@ -119,6 +119,7 @@ class SendMessageView(APIView):
         text = (data.get("text") or "").strip()
         attachment = request.FILES.get("attachment")
         kind = data.get("kind") or "text"
+        reply_to_id = data.get("replyTo") or data.get("reply_to") or data.get("replyToId")
 
         if not recipient_id:
             return Response({"error": "recipient is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -146,6 +147,13 @@ class SendMessageView(APIView):
         conv = get_or_create_direct_conversation(request.user, recipient)
         now = timezone.now()
 
+        # Only allow quoting a message that's actually IN this conversation —
+        # otherwise someone could pass an arbitrary message id from a chat
+        # they're not even part of and leak its text into the replyTo quote.
+        reply_to_message = (
+            Message.objects.filter(id=reply_to_id, conversation=conv).first() if reply_to_id else None
+        )
+
         msg = Message.objects.create(
             conversation=conv,
             sender=request.user,
@@ -155,6 +163,7 @@ class SendMessageView(APIView):
             attachment=attachment if attachment else None,
             attachment_name=attachment.name if attachment else "",
             attachment_size=attachment.size if attachment else None,
+            reply_to=reply_to_message,
         )
 
         conv.updated_at = now
@@ -189,6 +198,54 @@ class SendMessageView(APIView):
         })
 
         return Response(message_data, status=status.HTTP_201_CREATED)
+
+
+class MessageReactView(APIView):
+    """POST /api/messages/messages/<id>/react/
+    Body: { emoji: "👍" }
+
+    One reaction per user per message, WhatsApp/Slack-style: reacting with
+    the SAME emoji you already left removes it; reacting with a DIFFERENT
+    emoji replaces your previous one. Pushes the updated message (with its
+    fresh `reactions` list) to both conversation participants over the same
+    websocket channel messages already use, so an open thread updates live
+    without a manual refresh."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, message_id):
+        request.user.touch_active()
+        try:
+            msg = Message.objects.select_related("conversation", "sender", "recipient").get(
+                id=message_id, is_deleted=False
+            )
+        except Message.DoesNotExist:
+            return Response({"error": "Message not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not msg.conversation.memberships.filter(user=request.user).exists():
+            return Response(
+                {"error": "You are not part of this conversation."}, status=status.HTTP_403_FORBIDDEN
+            )
+
+        emoji = (request.data.get("emoji") or "").strip()
+        if not emoji:
+            return Response({"error": "emoji is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        existing = MessageReaction.objects.filter(message=msg, user=request.user).first()
+        if existing and existing.emoji == emoji:
+            existing.delete()
+        elif existing:
+            existing.emoji = emoji
+            existing.save(update_fields=["emoji"])
+        else:
+            MessageReaction.objects.create(message=msg, user=request.user, emoji=emoji)
+
+        message_data = MessageSerializer(msg, context={"request": request}).data
+        payload = {"type": "message.reaction", "conversation_id": msg.conversation_id, "message": message_data}
+        push_to_user(msg.sender_id, payload)
+        if msg.recipient_id:
+            push_to_user(msg.recipient_id, payload)
+        return Response(message_data)
 
 
 class MarkThreadReadView(APIView):
@@ -260,13 +317,37 @@ class CallStartView(APIView):
 
         # Don't let either side start a second call while one is already
         # in flight between the same two people (ringing or ongoing).
+        #
+        # BUT: a RINGING call only ever gets cleaned up by someone calling
+        # CallEndView — the caller's own 35s ring-timeout (see
+        # MessagingSocketContext.jsx startCall) does that, but only if
+        # their tab is still open and running when it fires. If the tab is
+        # closed, the browser crashes, or the network drops mid-ring, that
+        # timeout never runs and the Call row is left RINGING forever. Every
+        # later call attempt between the same two people then hit this
+        # branch and returned that SAME stale call as if it were still in
+        # progress — without ever pushing a fresh "call.incoming" to the
+        # callee — so the caller saw "Ringing..." while the other side's
+        # phone never actually rang again. Anything older than the ring
+        # timeout is clearly abandoned, not a real in-flight call, so treat
+        # it as missed and fall through to start a brand-new one instead.
+        RING_ABANDONED_AFTER = timezone.timedelta(seconds=45)
         existing = Call.objects.filter(
             status__in=[Call.RINGING, Call.ONGOING]
         ).filter(
             models.Q(caller=request.user, callee=callee) | models.Q(caller=callee, callee=request.user)
         ).first()
         if existing:
-            return Response(CallSerializer(existing, context={"request": request}).data, status=status.HTTP_200_OK)
+            is_abandoned_ring = (
+                existing.status == Call.RINGING
+                and timezone.now() - existing.started_at > RING_ABANDONED_AFTER
+            )
+            if is_abandoned_ring:
+                existing.status = Call.MISSED
+                existing.ended_at = timezone.now()
+                existing.save(update_fields=["status", "ended_at"])
+            else:
+                return Response(CallSerializer(existing, context={"request": request}).data, status=status.HTTP_200_OK)
 
         conv = get_or_create_direct_conversation(request.user, callee)
         callee_reachable = is_user_online(callee.id)

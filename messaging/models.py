@@ -104,6 +104,16 @@ class Message(models.Model):
     # VOICE messages reuse `attachment` for the audio file itself.
     voice_duration_seconds = models.PositiveIntegerField(null=True, blank=True)
 
+    # WhatsApp-style "reply" — quotes an earlier message in the SAME
+    # conversation. SET_NULL (not CASCADE) so deleting the original later
+    # doesn't blow away the reply that quoted it; the serializer shows
+    # "This message was deleted" once reply_to itself has is_deleted=True,
+    # and just omits the quote entirely if reply_to_id is None (the
+    # original row was hard-deleted, or this was never a reply).
+    reply_to = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="replies"
+    )
+
     is_read = models.BooleanField(default=False)
     is_deleted = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
@@ -113,6 +123,25 @@ class Message(models.Model):
 
     def __str__(self):
         return f"Message #{self.pk} in conversation {self.conversation_id}"
+
+
+class MessageReaction(models.Model):
+    """One emoji reaction per user per message (WhatsApp/Slack-style: a
+    second react with the SAME emoji removes it, a react with a DIFFERENT
+    emoji replaces it — see messaging/views.py MessageReactView). Kept as
+    its own table rather than a JSON blob on Message so `unique_together`
+    can enforce "one reaction per person" at the database level."""
+
+    message = models.ForeignKey(Message, related_name="reactions", on_delete=models.CASCADE)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, related_name="message_reactions", on_delete=models.CASCADE)
+    emoji = models.CharField(max_length=8)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("message", "user")
+
+    def __str__(self):
+        return f"{self.user.email} reacted {self.emoji} to message #{self.message_id}"
 
 
 class Call(models.Model):
