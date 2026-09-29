@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 
 from django.conf import settings
@@ -6,6 +7,7 @@ from django.db import models
 from django.utils import timezone
 
 from .constants import CATEGORIES
+from .storage import daily_report_storage
 
 
 class ActivityLog(models.Model):
@@ -93,7 +95,19 @@ def daily_report_file_path(instance, filename):
     # disk, only this relative path in Postgres (same pattern as
     # projects.module_file_path / expenses.expense_receipt_path).
     report = instance.report
-    return f"reports/daily/{report.user_id or 'anon'}/{report.date}/{uuid.uuid4()}_{os.path.basename(filename)}"
+    # Videos get their own ".../video/" folder: the Cloudinary storage decides
+    # image-vs-video upload from that folder (see reports/cloud_storage.py).
+    folder = "video/" if getattr(instance, "kind", "") == "video" else ""
+    # FIX (phone file names broke the upload): gallery names like
+    # "WhatsApp Video 2026-09-29 at 10.15.32 AM.mp4" or "IMG #1 (2).jpg" made
+    # the stored path longer than the old 100-char column (and contain
+    # characters that upset the file server). Keep only safe characters and a
+    # short name here; the real, original name is kept in original_name.
+    stem, ext = os.path.splitext(os.path.basename(filename))
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", stem).strip("_")[:40] or "file"
+    ext = re.sub(r"[^A-Za-z0-9]", "", ext)[:6].lower()
+    safe_name = f"{stem}.{ext}" if ext else stem
+    return f"reports/daily/{report.user_id or 'anon'}/{report.date}/{folder}{uuid.uuid4()}_{safe_name}"
 
 
 class DailyReport(models.Model):
@@ -138,7 +152,7 @@ class DailyReport(models.Model):
 
 class DailyReportFile(models.Model):
     report = models.ForeignKey(DailyReport, on_delete=models.CASCADE, related_name="files")
-    file = models.FileField(upload_to=daily_report_file_path)
+    file = models.FileField(upload_to=daily_report_file_path, storage=daily_report_storage, max_length=255)
     original_name = models.CharField(max_length=255)
     content_type = models.CharField(max_length=100, blank=True, default="")
     size = models.PositiveBigIntegerField(default=0)

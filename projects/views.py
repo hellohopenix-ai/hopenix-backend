@@ -316,10 +316,56 @@ class ModuleViewSet(viewsets.ModelViewSet):
         # employee could swap an already-approved URL for a different one
         # and it would stay live on the Portal unreviewed.
         instance = serializer.instance
+        old_status = instance.status
+        old_assignee = instance.assignee
+        old_assignee_name = getattr(old_assignee, "name", "") or ""
         extra = {}
         if serializer.validated_data.get("url", instance.url) != instance.url:
             extra = dict(url_approved=False, url_approved_by=None, url_approved_at=None)
-        serializer.save(**extra)
+        module = serializer.save(**extra)
+        self._mirror_module_to_tasks(module, old_status, old_assignee_name)
+
+    # FIX (module ticked on the Projects page never reached the Tasks page):
+    # the Task -> Module direction already existed (TaskViewSet.
+    # _sync_linked_module_status) but nothing pushed a Module change back to
+    # its Task, so a tick / status change / new assignee made from the
+    # Projects page stayed invisible on the Tasks page on every other device.
+    #
+    # NO-OVERRIDE RULE: only the field that really changed in THIS update is
+    # mirrored (status only if status changed, assignee only if the assignee
+    # changed), and the task's other assignees are kept. A plain edit of e.g.
+    # the module's priority can therefore never reset a task's status or wipe
+    # the group of people someone added on the Tasks page. queryset.update()
+    # is used on purpose so TaskViewSet.perform_update is not triggered and
+    # the two sides can never ping-pong.
+    def _mirror_module_to_tasks(self, module, old_status, old_assignee_name):
+        from tasks.models import Task
+
+        tasks = Task.objects.filter(module=module)
+        if not tasks.exists():
+            return
+
+        if module.status != old_status:
+            if module.status == "Completed":
+                tasks.exclude(status="Completed").update(status="Completed", progress=100)
+            elif module.status == "In Progress":
+                # progress must be > 0, otherwise the Task -> Module sync
+                # would read this task as "Pending" again.
+                tasks.exclude(status="In Progress", progress__gt=0, progress__lt=100).update(
+                    status="In Progress", progress=50
+                )
+            else:  # Pending (also "un-tick" of a completed module)
+                tasks.exclude(status="Pending", progress=0).update(status="Pending", progress=0)
+
+        new_assignee_name = getattr(module.assignee, "name", "") or ""
+        if new_assignee_name != old_assignee_name:
+            for task in tasks:
+                names = [n for n in (task.assignees or []) if n and n != old_assignee_name]
+                if new_assignee_name and new_assignee_name not in names:
+                    names.insert(0, new_assignee_name)
+                names = names[:3]  # a task holds at most 3 assignees
+                if names != (task.assignees or []):
+                    Task.objects.filter(pk=task.pk).update(assignees=names)
 
     @action(detail=True, methods=["post"], url_path="approve-url")
     def approve_url(self, request, project_pk=None, pk=None):

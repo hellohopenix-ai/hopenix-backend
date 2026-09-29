@@ -1,4 +1,5 @@
 import csv
+import logging
 import os
 import re
 from datetime import datetime, timedelta
@@ -36,6 +37,8 @@ from .services import log_activity, user_label
 from .stats import activity_block, chart_data, currency_symbol, entity_stats, finance_stats, user_rows, workload
 from .uploads import validate_upload
 from .utils import RangeError, fill_days, get_tz, resolve_range
+
+logger = logging.getLogger(__name__)
 
 User = get_user_model()
 
@@ -500,13 +503,24 @@ class DailyReportListCreateView(ReportsAPIView):
                         report=report, file=f, original_name=os.path.basename(f.name)[:255],
                         content_type=content_type, size=f.size, kind=kind,
                     ))
-        except Exception:
+        except Exception as exc:
             for obj in saved:  # don't leave bytes on disk for a report that rolled back
                 try:
                     obj.file.storage.delete(obj.file.name)
                 except Exception:
                     pass
-            raise
+            # FIX (daily report upload failed with a bare "Request failed
+            # (500)" HTML page): a storage/Cloudinary problem used to bubble up
+            # as an unhandled 500, so neither the user nor the logs said why.
+            # Log the real error and answer with a JSON message the page shows.
+            logger.exception("Daily report file upload failed (user=%s)", user.pk)
+            reason = ""
+            if type(exc).__module__.startswith("cloudinary"):
+                reason = f" ({str(exc)[:200]})"  # e.g. "File size too large. Maximum is 10485760"
+            return Response(
+                {"error": f"The file server could not save your photo/video{reason}. Nothing was submitted — please try again."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
 
         log_activity(
             action="create", user=user, module="Reports",
