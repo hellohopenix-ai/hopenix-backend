@@ -2,7 +2,7 @@ import re
 from collections.abc import Mapping
 from decimal import Decimal
 
-from django.db import transaction
+from django.db import connection, transaction
 from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.reverse import reverse
@@ -19,6 +19,9 @@ from .models import (
     CoworkingSettings,
     PaymentMethod,
     Seating,
+    normalize_chair,
+    occupied_chairs,
+    split_chairs,
     total_chairs,
 )
 
@@ -33,6 +36,11 @@ WEBSITE_RE = re.compile(r"^https?://.+\..+")
 MAX_IMAGE_BYTES = 5 * 1024 * 1024  # the page's own "under 5MB" limit
 MAX_DURATION_MONTHS = 60  # sanity bound only; the page's copy says "1 - 12 months"
 MAX_MEMBERS = 50
+
+# Postgres advisory-lock key that serialises "submit an application" so two
+# people can't both grab the same chair in the same instant. (Different from
+# the approval lock in views.py -- the two never need to wait on each other.)
+_CHAIR_LOCK_KEY = 726_016
 
 
 def _is_id_number(value):
@@ -272,11 +280,45 @@ class ApplicationCreateSerializer(_BlankTolerantSerializer):
             )
         return attrs
 
+    @staticmethod
+    def _check_chairs_free(validated, members):
+        """Refuse the submission if any chair number it names is already held
+        by another Pending / Approved application. Errors are flat strings
+        (same as every other rule here) so the page's toast can show them."""
+        wanted = {}  # key -> (label as typed, field it came from)
+        for label in split_chairs(validated.get("assigned_chairs", "")):
+            wanted.setdefault(normalize_chair(label), (label, "assignedChairs"))
+        for m in members:
+            for label in split_chairs(m.get("chair_no", "")):
+                wanted.setdefault(normalize_chair(label), (label, "members"))
+        wanted.pop("", None)
+        if not wanted:
+            return
+
+        taken = occupied_chairs()
+        clashes = [(label, field) for key, (label, field) in wanted.items() if key in taken]
+        if not clashes:
+            return
+        labels = ", ".join(label for label, _ in clashes)
+        message = (
+            f"Chair {labels} is already occupied — please choose a different chair number."
+            if len(clashes) == 1
+            else f"Chairs {labels} are already occupied — please choose different chair numbers."
+        )
+        raise serializers.ValidationError({clashes[0][1]: [message]})
+
     @transaction.atomic
     def create(self, validated):
         request = self.context.get("request")
         user = getattr(request, "user", None)
         members = validated.pop("members")
+
+        # Check + insert under one lock so two simultaneous submissions for
+        # the same chair can't both pass the check.
+        if connection.vendor == "postgresql":
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_xact_lock(%s)", [_CHAIR_LOCK_KEY])
+        self._check_chairs_free(validated, members)
 
         # dict.fromkeys = de-duplicate, keep the order the user picked them in
         validated["applicant_type"] = list(dict.fromkeys(validated["applicant_type"]))

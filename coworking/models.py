@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 from datetime import date
 from decimal import Decimal
@@ -287,6 +288,58 @@ class CoworkingApplication(models.Model):
             index = start.month - 1 + i
             keys.append(f"{start.year + index // 12}-{index % 12 + 1:02d}")
         return keys
+
+
+# --- Chair-number uniqueness -------------------------------------------------
+# Chair numbers are free text on the form (Section D "Assigned Chair /
+# Workstation No(s)." -- e.g. "C-04, C-05" -- and one "Chair No." per member
+# in Section E; the office may also type them in the Section J review).
+# These helpers turn all of that into a comparable form so "C-04", "c04" and
+# "C 4" are all recognised as the same physical chair.
+_CHAIR_SPLIT_RE = re.compile(r"[,;/\n]+")
+
+
+def split_chairs(raw):
+    """"C-04, C-05" -> ["C-04", "C-05"] (blank pieces dropped)."""
+    return [part.strip() for part in _CHAIR_SPLIT_RE.split(raw or "") if part.strip()]
+
+
+def normalize_chair(label):
+    """Comparison key for one chair label: upper-case, no spaces / hyphens /
+    underscores / dots, and no leading zeros in numbers ("C-04" -> "C4")."""
+    key = re.sub(r"[\s\-_.]+", "", str(label or "")).upper()
+    return re.sub(r"\d+", lambda m: str(int(m.group())), key)
+
+
+def chairs_for_application(app):
+    """{normalized_key: label as typed} for every chair number an application
+    has claimed -- assigned chairs, its members' chairs, and the chairs the
+    office wrote into the review."""
+    labels = split_chairs(app.assigned_chairs)
+    for member in app.members.all():
+        labels += split_chairs(member.chair_no)
+    review = app.review_or_none
+    if review:
+        labels += split_chairs(review.chair_nos)
+    return {normalize_chair(label): label for label in labels if normalize_chair(label)}
+
+
+def occupied_chairs(exclude_pk=None):
+    """{normalized_key: (label, application code)} for chairs held by any
+    application that is still Pending or Approved. A Rejected application
+    frees its chairs again."""
+    apps = (
+        CoworkingApplication.objects.exclude(status=ApplicationStatus.REJECTED)
+        .select_related("review")
+        .prefetch_related("members")
+    )
+    if exclude_pk is not None:
+        apps = apps.exclude(pk=exclude_pk)
+    taken = {}
+    for app in apps:
+        for key, label in chairs_for_application(app).items():
+            taken.setdefault(key, (label, app.code))
+    return taken
 
 
 class CoworkingMember(models.Model):

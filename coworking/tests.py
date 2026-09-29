@@ -133,7 +133,17 @@ class CoworkingTestCase(TestCase):
             body.update(cnicFront=png("front.png"), cnicBack=png("back.png"), photo=png("me.png"))
         return self.api(user or self.manager).post(LIST_URL, body, format="multipart")
 
+    _chair_seq = 0
+
     def make_application(self, **overrides):
+        # Two applications can't hold the same chair, so every application a
+        # test creates in bulk gets its own chair number unless the test
+        # passes `members` itself.
+        if "members" not in overrides:
+            CoworkingTestCase._chair_seq += 1
+            overrides["members"] = [
+                {"name": "Ayesha Khan", "cnic": "", "phone": "", "chairNo": f"T-{CoworkingTestCase._chair_seq}"}
+            ]
         response = self.submit(**overrides)
         self.assertEqual(response.status_code, 201, response.content)
         return response.json()
@@ -322,6 +332,78 @@ class SubmitTests(CoworkingTestCase):
 
 
 # ==========================================================================
+class ChairOccupiedTests(CoworkingTestCase):
+    """The same chair number can't be taken by a second application."""
+
+    def members(self, *chairs):
+        return [{"name": f"Person {i}", "cnic": "", "phone": "", "chairNo": c} for i, c in enumerate(chairs, 1)]
+
+    def test_a_chair_already_taken_by_another_application_is_refused(self):
+        self.make_application(members=self.members("C-04"))
+        response = self.submit(members=self.members("C-04"))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("already occupied", " ".join(response.json()["members"]))
+        self.assertEqual(CoworkingApplication.objects.count(), 1)
+
+    def test_the_same_chair_written_differently_is_still_the_same_chair(self):
+        self.make_application(members=self.members("C-04"))
+        for variant in ("c04", "C 4", " c-04 ", "C-004"):
+            response = self.submit(members=self.members(variant))
+            self.assertEqual(response.status_code, 400, variant)
+
+    def test_assigned_chairs_are_checked_too_and_lists_are_split(self):
+        self.make_application(assignedChairs="C-10, C-11", members=self.members("C-10"))
+        response = self.submit(assignedChairs="C-11", members=self.members("C-30"))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("C-11 is already occupied", " ".join(response.json()["assignedChairs"]))
+
+    def test_a_member_chair_clashes_with_someone_elses_assigned_chair(self):
+        self.make_application(assignedChairs="C-20", members=self.members("C-20"))
+        response = self.submit(members=self.members("c20"))
+        self.assertEqual(response.status_code, 400)
+
+    def test_every_clashing_chair_is_named_in_the_message(self):
+        self.make_application(assignedChairs="C-01, C-02", members=self.members("C-01"))
+        response = self.submit(assignedChairs="C-01, C-02, C-03", members=self.members("C-03"))
+        self.assertEqual(response.status_code, 400)
+        message = " ".join(response.json()["assignedChairs"])
+        self.assertIn("C-01, C-02", message)
+        self.assertNotIn("C-03", message)
+
+    def test_a_different_chair_is_fine(self):
+        self.make_application(members=self.members("C-04"))
+        response = self.submit(members=self.members("C-05"))
+        self.assertEqual(response.status_code, 201, response.content)
+
+    def test_blank_chair_numbers_never_clash(self):
+        self.make_application(members=self.members(""))
+        response = self.submit(members=self.members(""))
+        self.assertEqual(response.status_code, 201, response.content)
+
+    def test_a_rejected_application_frees_its_chair(self):
+        code = self.make_application(members=self.members("C-04"))["id"]
+        self.api(self.admin).post(detail(code, "review/"), {"decision": "Rejected"}, format="json")
+        response = self.submit(members=self.members("C-04"))
+        self.assertEqual(response.status_code, 201, response.content)
+
+    def test_pending_and_approved_applications_both_hold_their_chair(self):
+        code = self.make_application(members=self.members("C-04"))["id"]
+        self.api(self.admin).post(detail(code, "review/"), {"decision": "Approved"}, format="json")
+        self.assertEqual(self.submit(members=self.members("C-04")).status_code, 400)
+
+    def test_chairs_the_office_wrote_into_the_review_count_as_taken(self):
+        code = self.make_application(members=self.members("C-04"))["id"]
+        self.api(self.admin).post(
+            detail(code, "review/"), {"decision": "Approved", "chairNos": "C-07"}, format="json"
+        )
+        self.assertEqual(self.submit(members=self.members("C-07")).status_code, 400)
+
+    def test_deleting_an_application_frees_its_chair(self):
+        code = self.make_application(members=self.members("C-04"))["id"]
+        self.api(self.admin).delete(detail(code))
+        self.assertEqual(self.submit(members=self.members("C-04")).status_code, 201)
+
+
 class PermissionTests(CoworkingTestCase):
     def test_only_admin_and_manager_can_touch_anything(self):
         code = self.make_application()["id"]
