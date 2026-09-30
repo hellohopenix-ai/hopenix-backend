@@ -573,66 +573,61 @@ class UserGrowthView(APIView):
 
 
 class DashboardNotificationsView(APIView):
-    """GET /api/dashboard/notifications/?limit=6
-    Real recent activity across the app, for the bell icon dropdown.
+    """GET /api/dashboard/notifications/?limit=30
+    Bell-icon feed, newest first, straight from reports.ActivityLog (the
+    same audit trail the Reports page shows).
 
-    FIX: the bell used to show a hardcoded NOTIFICATIONS constant in
-    Dashboard.jsx — always the same 3 fake items ("Jenny placed an
-    order worth $120", ...) no matter what actually happened. This
-    pulls together the handful of things across the app that are
-    genuinely worth a notification — new clients, real received
-    payments, and anything actually awaiting someone's review/decision
-    (pending expenses, module start requests, new project intake
-    requests) — sorted newest-first.
+      * admin    -> EVERY recorded activity on the website (sales, expenses,
+                    income, clients, tasks, projects, users, ...), including
+                    their own actions.
+      * employee -> only activity on the pages that user is allowed to open
+                    (users.access.allowed_pages), never their own actions,
+                    never Settings/Users/login noise.
+      * client   -> 403.
+
+    Left out for everyone: pure navigation noise (view / click / search /
+    generic api calls), login/logout, and chat traffic (Messages already
+    have their own sidebar dot + push notification).
     """
 
     permission_classes = [permissions.IsAuthenticated]
 
+    # Pages whose activity is logged under a different module label.
+    _PAGE_TO_MODULE = {"Zip Files": "Projects", "Client Portal": "Clients"}
+
     def get(self, request):
-        _deny_clients(request.user)
-        limit = int(request.query_params.get("limit", 6))
-        items = []
+        from reports.models import ActivityLog
+        from users.access import allowed_pages
 
-        for c in Client.objects.order_by("-created_at")[:limit]:
-            items.append({
-                "title": "New client added",
-                "desc": f"{c.name} was added as a new client",
-                "time": c.created_at,
+        user = request.user
+        _deny_clients(user)
+
+        try:
+            limit = max(1, min(int(request.query_params.get("limit", 30)), 50))
+        except (TypeError, ValueError):
+            limit = 30
+
+        qs = (
+            ActivityLog.objects
+            .exclude(action__in=["view", "click", "search", "api", "login", "logout"])
+            .exclude(module="Messages")
+        )
+        if getattr(user, "role", None) != "admin":
+            modules = {
+                self._PAGE_TO_MODULE.get(p, p)
+                for p in allowed_pages(user)
+            } - {"Dashboard", "Messages", "Settings", "Users", "Client Portal"}
+            qs = qs.filter(module__in=modules).exclude(user=user)
+
+        data = []
+        for a in qs.order_by("-created_at", "-id")[:limit]:
+            label = ActivityLog.ACTION_LABELS.get(a.action, a.action.title())
+            data.append({
+                "id": a.id,
+                "title": f"{a.actor_name or 'System'} — {label} · {a.module}",
+                "desc": a.description or a.object_repr or label,
+                "time": a.created_at.isoformat(),
             })
-
-        for inc in Income.objects.filter(status="Received").order_by("-created_at")[:limit]:
-            items.append({
-                "title": "Payment received",
-                "desc": f"{inc.description or inc.project or 'A payment'} — PKR {inc.amount:,.0f}",
-                "time": inc.created_at,
-            })
-
-        for exp in RealExpense.objects.filter(status=ExpenseStatus.PENDING).order_by("-created_at")[:limit]:
-            items.append({
-                "title": "Expense awaiting approval",
-                "desc": f"{exp.title} — PKR {exp.amount:,.0f}",
-                "time": exp.created_at,
-            })
-
-        for mr in ModuleRequest.objects.filter(status="pending").select_related("client", "module").order_by("-requested_at")[:limit]:
-            items.append({
-                "title": "Module request pending",
-                "desc": f"{mr.client.name} wants to start \"{mr.module.name}\"",
-                "time": mr.requested_at,
-            })
-
-        for ir in IntakeRequest.objects.filter(status="pending").order_by("-created_at")[:limit]:
-            items.append({
-                "title": "New project request",
-                "desc": f"{ir.company_name or ir.contact_person} submitted a new project request",
-                "time": ir.created_at,
-            })
-
-        items.sort(key=lambda x: x["time"], reverse=True)
-        data = [
-            {"id": i + 1, "title": it["title"], "desc": it["desc"], "time": it["time"].isoformat()}
-            for i, it in enumerate(items[:limit])
-        ]
         return Response(data)
 
 
