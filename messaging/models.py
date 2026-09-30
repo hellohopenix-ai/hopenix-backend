@@ -214,3 +214,20 @@ class PushSubscription(models.Model):
 
     def __str__(self):
         return f"PushSubscription for {self.user.email} ({self.endpoint[:40]}...)"
+
+
+class BirthdayNotice(models.Model):
+    """Remembers that today's birthday notification for one person/client was
+    already sent, so it goes out exactly once per year even if the server
+    restarts or several workers run (see messaging/birthdays.py)."""
+
+    kind = models.CharField(max_length=10)  # "user" | "client"
+    ref_id = models.PositiveIntegerField()
+    year = models.PositiveSmallIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("kind", "ref_id", "year")
+
+    def __str__(self):
+        return f"birthday {self.kind}#{self.ref_id} {self.year}"

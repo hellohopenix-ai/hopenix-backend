@@ -8,4 +8,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         send_due_reminders()
+        from messaging.birthdays import send_birthday_notifications
+
+        send_birthday_notifications()
         self.stdout.write("done")

@@ -115,6 +115,12 @@ def _loop():
             send_due_reminders()
         except Exception:  # noqa: BLE001 - e.g. migration not applied yet; keep looping
             logger.exception("Meeting reminder pass failed")
+        try:
+            from messaging.birthdays import send_birthday_notifications
+
+            send_birthday_notifications()
+        except Exception:  # noqa: BLE001
+            logger.exception("Birthday notification pass failed")
         time.sleep(60)
 
 
