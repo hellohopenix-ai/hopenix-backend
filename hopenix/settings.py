@@ -221,6 +221,13 @@ REST_FRAMEWORK = {
     },
 }
 
+# Production serves JSON only. The HTML "browsable API" page needs DRF's
+# static files (bootstrap.min.css ...) from the WhiteNoise manifest, and opening
+# an endpoint like /api/auth/login/ in a browser crashed with a 500 when that
+# manifest entry was missing. The React app only ever talks JSON, so nothing else changes.
+if not DEBUG:
+    REST_FRAMEWORK['DEFAULT_RENDERER_CLASSES'] = ['rest_framework.renderers.JSONRenderer']
+
 # Cache backend for both DRF throttling and any future caching. Falls back
 # to per-process local memory (fine for a single dev server) and switches
 # to Redis automatically once REDIS_URL is set in .env (same variable
