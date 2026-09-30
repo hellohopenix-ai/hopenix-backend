@@ -59,9 +59,7 @@ def _notify_admins_of_application(application, request):
     application itself is already saved by the time this runs.
     """
     try:
-        from messaging.consumers import is_user_online
-        from messaging.push_utils import send_web_push
-        from messaging.views import push_to_user
+        from messaging.push_utils import notify_user
     except Exception:
         return
 
@@ -70,15 +68,12 @@ def _notify_admins_of_application(application, request):
         "type": "coworking.application",
         "id": application.code,
         "title": "New Coworking Application",
-        "body": f"{who} applied for {application.chairs} chair{'s' if application.chairs != 1 else ''} ({application.code}).",
+        "body": f"{who} applied for {application.chairs} chair{'s' if application.chairs != 1 else ''} ({application.code}) — waiting for approval.",
     }
-    admins = User.objects.filter(role="admin").exclude(id=getattr(request.user, "id", None))
+    admins = User.objects.filter(role="admin", is_active=True).exclude(id=getattr(request.user, "id", None))
     for admin in admins:
         try:
-            if is_user_online(admin.id):
-                push_to_user(admin.id, payload)
-            else:
-                send_web_push(admin, payload)
+            notify_user(admin, dict(payload))
         except Exception:
             logger.exception("Coworking notification to user %s failed", admin.id)
 

@@ -43,6 +43,8 @@ def send_web_push(user, payload: dict):
 
     # Calls are only worth ringing for a short while; everything else may wait.
     ttl = 45 if payload.get("type") == "call.incoming" else 86400
+    # Calls / messages should wake the phone immediately; everything else
+    # (task, project) is normal urgency.
     subs = list(PushSubscription.objects.filter(user=user))
     if not subs:
         logger.info("Web push skipped for %s: no subscribed device (Enable was never accepted on a phone/browser).", user.email)
@@ -62,6 +64,7 @@ def send_web_push(user, payload: dict):
                 # "high" makes Android deliver straight away even in battery
                 # saving (Doze) instead of batching the push for later.
                 headers={"Urgency": "high"},
+                timeout=10,  # never let a slow push service hang the request that triggered it
             )
         except WebPushException as exc:
             response = getattr(exc, "response", None)
@@ -89,6 +92,21 @@ def send_incoming_call_push(callee, call_data, caller_name):
         "call": call_data,
         "title": f"Incoming call from {caller_name}",
         "body": "Audio call" if call_data.get("callType") == "audio" else "Video call",
+    })
+
+
+def send_missed_call_push(callee, call_data, caller_name):
+    """Shown on the callee's phone/laptop when a call they never picked up
+    ends (caller hung up or gave up ringing). Uses the SAME notification tag
+    as the ringing one (call-<id>, see public/sw.js) so it REPLACES the
+    "Incoming call" banner with a "Missed call" one, icon included."""
+    kind = "Video call" if call_data.get("callType") == "video" else "Voice call"
+    send_web_push(callee, {
+        "type": "call.missed",
+        "call": call_data,
+        "callerId": call_data.get("callerId"),
+        "title": "Missed call",
+        "body": f"{caller_name} · {kind}",
     })
 
 
@@ -199,3 +217,22 @@ def notify_module_assigned(module, assigner):
         "title": "New task assigned",
         "body": f'{assigner_name} assigned you "{module.name}" in {project_name}',
     })
+
+
+def notify_project_assigned(project, users, assigner):
+    """People newly added to a project (as manager or team member) get a
+    notification. `users` = iterable of User objects. Never notifies the
+    person who made the change."""
+    assigner_id = getattr(assigner, "id", None)
+    assigner_name = getattr(assigner, "name", "") or "Someone"
+    seen = set()
+    for user in users:
+        if user is None or user.id == assigner_id or user.id in seen or not user.is_active:
+            continue
+        seen.add(user.id)
+        notify_user(user, {
+            "type": "project.assigned",
+            "projectId": project.id,
+            "title": "Added to a project",
+            "body": f'{assigner_name} added you to "{project.name}"',
+        })

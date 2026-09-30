@@ -64,6 +64,10 @@ class Meeting(models.Model):
         blank=True,
         related_name="created_meetings",
     )
+    # Notification bookkeeping (see meetings/reminders.py): each reminder is
+    # sent once — "meeting today" (morning) and "starting in 15 minutes".
+    day_reminder_sent = models.BooleanField(default=False)
+    soon_reminder_sent = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

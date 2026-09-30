@@ -6,6 +6,7 @@ from rest_framework.views import APIView
 
 from .models import Availability, Meeting, MeetingRequest, RescheduleRequest
 from .permissions import can_manage_meetings
+from .reminders import after_meeting_created
 from .serializers import (
     AvailabilitySerializer,
     MeetingRequestSerializer,
@@ -19,6 +20,28 @@ from .serializers import (
 
 def _display_name(user):
     return getattr(user, "name", "") or getattr(user, "email", "") or "You"
+
+
+def _notify_managers(payload, exclude_id=None):
+    """Alert every admin/manager (live + OS push). Never breaks the request."""
+    try:
+        from django.contrib.auth import get_user_model
+        from messaging.push_utils import notify_user
+
+        for u in get_user_model().objects.filter(role__in=["admin", "manager"], is_active=True).exclude(id=exclude_id):
+            notify_user(u, dict(payload))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _notify_requester(req, kind, title, body):
+    try:
+        from messaging.push_utils import notify_user
+
+        if req.requested_by_id and req.requested_by.is_active:
+            notify_user(req.requested_by, {"type": kind, "title": title, "body": body})
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class IsAuthenticatedReadManagerWrite(permissions.BasePermission):
@@ -75,7 +98,8 @@ class MeetingViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         created_by = serializer.validated_data.get("created_by") or _display_name(self.request.user)
-        serializer.save(created_by=created_by, created_by_user=self.request.user)
+        meeting = serializer.save(created_by=created_by, created_by_user=self.request.user)
+        after_meeting_created(meeting, self.request.user)
 
     @action(detail=True, methods=["post"], url_path="set-status")
     def set_status(self, request, pk=None):
@@ -166,11 +190,19 @@ class MeetingRequestViewSet(viewsets.ModelViewSet):
         user = self.request.user
         name = serializer.validated_data.get("name") or _display_name(user)
         org = serializer.validated_data.get("org") or serializer.validated_data.get("project", "General")
-        serializer.save(
+        req = serializer.save(
             name=name,
             role=serializer.validated_data.get("role") or getattr(user, "role", ""),
             org=org,
             requested_by=user,
+        )
+        _notify_managers(
+            {
+                "type": "meeting.request",
+                "title": "New meeting request",
+                "body": f"{name} requested a meeting for {req.project} on {req.raw_date.strftime('%d %b')} at {req.raw_time.strftime('%I:%M %p').lstrip('0')}",
+            },
+            exclude_id=user.id,
         )
 
     @action(detail=True, methods=["post"])
@@ -208,6 +240,9 @@ class MeetingRequestViewSet(viewsets.ModelViewSet):
         req.status = "approved"
         req.resulting_meeting = meeting
         req.save(update_fields=["status", "resulting_meeting"])
+        after_meeting_created(meeting, request.user)
+        _notify_requester(req, "meeting.approved", "Meeting request approved",
+                          f"Your meeting for {req.project} is confirmed for {req.raw_date.strftime('%d %b')} at {req.raw_time.strftime('%I:%M %p').lstrip('0')}")
         return Response(MeetingRequestSerializer(req).data)
 
     @action(detail=True, methods=["post"])
@@ -219,6 +254,8 @@ class MeetingRequestViewSet(viewsets.ModelViewSet):
             return Response({"detail": "This request has already been reviewed."}, status=400)
         req.status = "rejected"
         req.save(update_fields=["status"])
+        _notify_requester(req, "meeting.rejected", "Meeting request declined",
+                          f"Your meeting request for {req.project} was declined")
         return Response(MeetingRequestSerializer(req).data)
 
 
@@ -261,6 +298,14 @@ class RescheduleRequestViewSet(viewsets.ModelViewSet):
             role=serializer.validated_data.get("role") or getattr(user, "role", ""),
             project=serializer.validated_data.get("project") or meeting.project,
             requested_by=user,
+        )
+        _notify_managers(
+            {
+                "type": "meeting.request",
+                "title": "Reschedule request",
+                "body": f'{name} asked to reschedule "{meeting.title}"',
+            },
+            exclude_id=user.id,
         )
 
     @action(detail=True, methods=["post"])

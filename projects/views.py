@@ -27,7 +27,7 @@ from .permissions import (
     ProjectObjectPermission,
 )
 from .utils import build_project_zip
-from messaging.push_utils import notify_module_assigned
+from messaging.push_utils import notify_module_assigned, notify_project_assigned
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +225,29 @@ class ProjectViewSet(viewsets.ModelViewSet):
         return ProjectListSerializer if self.action == "list" else ProjectDetailSerializer
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        project = serializer.save(created_by=self.request.user)
+        self._notify_project_people(project, set())
+
+    def perform_update(self, serializer):
+        old = serializer.instance
+        old_ids = set(old.team.values_list("id", flat=True))
+        if old.manager_id:
+            old_ids.add(old.manager_id)
+        project = serializer.save()
+        self._notify_project_people(project, old_ids)
+
+    def _notify_project_people(self, project, already_ids):
+        """OS + in-app notification for everyone newly added to the project
+        (manager or team). Never allowed to fail the save."""
+        try:
+            people = list(project.team.all())
+            if project.manager_id:
+                people.append(project.manager)
+            new_people = [u for u in people if u.id not in already_ids]
+            if new_people:
+                notify_project_assigned(project, new_people, self.request.user)
+        except Exception:  # noqa: BLE001
+            logger.exception("Project-assignment notification failed")
 
     def destroy(self, request, *args, **kwargs):
         # Sirf admin, aur hard-delete nahi — soft delete (is_archived).

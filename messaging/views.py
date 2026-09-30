@@ -12,7 +12,7 @@ from channels.layers import get_channel_layer
 from .consumers import is_user_online, user_group_name
 from .models import Call, Conversation, Message, MessageReaction, Participant, PushSubscription
 from .permissions import can_message, get_allowed_contact_ids, get_allowed_contacts
-from .push_utils import send_incoming_call_push, send_new_message_push
+from .push_utils import send_incoming_call_push, send_missed_call_push, send_new_message_push
 from .serializers import CallSerializer, ContactSerializer, ConversationListSerializer, MessageSerializer
 
 User = get_user_model()
@@ -359,6 +359,16 @@ class CallStartView(APIView):
                 existing.status = Call.MISSED
                 existing.ended_at = timezone.now()
                 existing.save(update_fields=["status", "ended_at"])
+                # The callee never got to answer — leave them a "Missed call"
+                # notification (replaces the old ringing one).
+                try:
+                    send_missed_call_push(
+                        existing.callee,
+                        CallSerializer(existing, context={"request": request}).data,
+                        existing.caller.name,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             else:
                 return Response(CallSerializer(existing, context={"request": request}).data, status=status.HTTP_200_OK)
 
@@ -461,6 +471,7 @@ class CallEndView(APIView):
             return Response(CallSerializer(call, context={"request": request}).data)
 
         now = timezone.now()
+        was_ringing = call.status == Call.RINGING
         if call.status == Call.RINGING:
             call.status = Call.MISSED
         else:
@@ -473,6 +484,14 @@ class CallEndView(APIView):
         call_data = CallSerializer(call, context={"request": request}).data
         other_id = call.callee_id if request.user.id == call.caller_id else call.caller_id
         push_to_user(other_id, {"type": "call.ended", "call": call_data})
+
+        # Caller hung up / gave up while it was still ringing -> the callee
+        # missed it. Notify them WhatsApp-style (also when the site is closed).
+        if was_ringing and request.user.id == call.caller_id:
+            try:
+                send_missed_call_push(call.callee, call_data, request.user.name)
+            except Exception:  # noqa: BLE001
+                pass
 
         return Response(call_data)
 

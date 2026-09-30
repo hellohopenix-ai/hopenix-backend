@@ -30,29 +30,23 @@ def _notify_admins_of_visitor(visitor, request):
     disruptive than the whole Visitors API refusing to start.
     """
     try:
-        from messaging.consumers import is_user_online
-        from messaging.push_utils import send_web_push
-        from messaging.views import push_to_user
+        from messaging.push_utils import notify_user
     except Exception:
         return
 
     data = VisitorSerializer(visitor, context={"request": request}).data
-    title = "New Visitor Approval Request"
+    title = "Visitor arrived"
     body = f"{visitor.name}{f' — {visitor.company}' if visitor.company else ''} is waiting to meet {visitor.meeting_with or 'you'}."
 
-    # Every admin except the one who just registered this visitor
-    # themselves (they already know — they just submitted the form).
-    admins = User.objects.filter(role="admin").exclude(id=getattr(request.user, "id", None))
+    # Every admin except the one who just registered this visitor.
+    # notify_user = live socket (sound/dot while the app is open) AND OS Web
+    # Push (banner + sound even with the site closed or in a background tab).
+    admins = User.objects.filter(role="admin", is_active=True).exclude(id=getattr(request.user, "id", None))
     for admin in admins:
         payload = {"type": "visitor.request", "visitor": data, "title": title, "body": body}
         try:
-            if is_user_online(admin.id):
-                push_to_user(admin.id, payload)
-            else:
-                send_web_push(admin, payload)
+            notify_user(admin, payload)
         except Exception:
-            # Never let a notification failure break the actual
-            # registration — the visitor record itself is already saved.
             continue
 
 
