@@ -29,8 +29,26 @@ def send_web_push(user, payload: dict):
     has subscribed on. Silently drops subscriptions the browser has since
     revoked (410 Gone / 404 Not Found) by deleting them, so dead endpoints
     don't pile up. Never raises — a push failure should never break the
-    call flow that triggered it (the websocket/REST path still works)."""
-    for sub in PushSubscription.objects.filter(user=user):
+    call/message flow that triggered it (the websocket/REST path still works).
+
+    Every failure is written to the server log with the push service's own
+    answer, so "why didn't the notification arrive" can be read straight from
+    the Railway logs."""
+    if webpush is None:
+        logger.error("Web push NOT sent: the pywebpush package is not installed.")
+        return
+    if not getattr(settings, "VAPID_PRIVATE_KEY", ""):
+        logger.error("Web push NOT sent: VAPID_PRIVATE_KEY is empty. Set it in the Railway variables.")
+        return
+
+    # Calls are only worth ringing for a short while; everything else may wait.
+    ttl = 45 if payload.get("type") == "call.incoming" else 86400
+    subs = list(PushSubscription.objects.filter(user=user))
+    if not subs:
+        logger.info("Web push skipped for %s: no subscribed device (Enable was never accepted on a phone/browser).", user.email)
+        return
+
+    for sub in subs:
         try:
             webpush(
                 subscription_info={
@@ -40,13 +58,26 @@ def send_web_push(user, payload: dict):
                 data=json.dumps(payload),
                 vapid_private_key=settings.VAPID_PRIVATE_KEY,
                 vapid_claims=dict(settings.VAPID_CLAIMS),  # webpush mutates this dict — always pass a fresh copy
+                ttl=ttl,
+                # "high" makes Android deliver straight away even in battery
+                # saving (Doze) instead of batching the push for later.
+                headers={"Urgency": "high"},
             )
         except WebPushException as exc:
-            status_code = getattr(exc.response, "status_code", None)
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
             if status_code in (404, 410):
                 sub.delete()
+                logger.info("Web push: removed expired subscription of %s (%s).", user.email, status_code)
             else:
-                logger.warning("Web push failed for %s: %s", user.email, exc)
+                body = ""
+                try:
+                    body = (response.text or "")[:300] if response is not None else ""
+                except Exception:  # noqa: BLE001
+                    pass
+                logger.error("Web push failed for %s: status=%s error=%s body=%s", user.email, status_code, exc, body)
+        except Exception:  # noqa: BLE001 - bad key format, network error, ...
+            logger.exception("Web push crashed for %s", user.email)
 
 
 def send_incoming_call_push(callee, call_data, caller_name):
