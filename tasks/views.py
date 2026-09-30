@@ -1,3 +1,5 @@
+import logging
+
 from django.shortcuts import get_object_or_404
 from django.http import FileResponse
 from django.utils import timezone
@@ -7,6 +9,7 @@ from rest_framework.response import Response
 
 from projects.models import ModuleFile, Module, ModuleStatusChoices
 from users.access import ModuleAccess
+from messaging.push_utils import notify_tasks_assigned
 
 from .models import Task, TaskZipFile
 from .serializers import (
@@ -17,6 +20,8 @@ from .serializers import (
     TaskToggleSubtaskSerializer,
     TaskZipFileSerializer,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _drop_zip_entries(task, zip_pk):
@@ -183,7 +188,17 @@ class TaskViewSet(viewsets.ModelViewSet):
         created_by = serializer.validated_data.get("created_by") or getattr(
             self.request.user, "name", ""
         ) or "Admin"
-        serializer.save(created_by=created_by)
+        task = serializer.save(created_by=created_by)
+        self._notify_new_assignees([(task, list(task.assignees or []))])
+
+    def _notify_new_assignees(self, assignments):
+        """Tell people they were just assigned a task (sidebar red dot +
+        OS notification). `assignments` = [(task, [names newly added])].
+        A notification problem must never fail the save itself."""
+        try:
+            notify_tasks_assigned(assignments, self.request.user)
+        except Exception:  # noqa: BLE001
+            logger.exception("Task-assignment notification failed")
 
     # FIX (Priority 2 — "ticked module on Task Page, Client Page never
     # showed it ticked"): nothing anywhere in this app ever wrote to
@@ -209,8 +224,14 @@ class TaskViewSet(viewsets.ModelViewSet):
         Module.objects.filter(pk=task.module_id).exclude(status=new_status).update(status=new_status)
 
     def perform_update(self, serializer):
+        # Snapshot BEFORE save(): serializer.instance is updated in place,
+        # so afterwards the old assignee list would be gone.
+        before = set(serializer.instance.assignees or [])
         task = serializer.save()
         self._sync_linked_module_status(task)
+        added = [n for n in (task.assignees or []) if n not in before]
+        if added:
+            self._notify_new_assignees([(task, added)])
 
     @action(detail=False, methods=["post"], url_path="bulk-create")
     def bulk_create(self, request):
@@ -232,6 +253,7 @@ class TaskViewSet(viewsets.ModelViewSet):
             serializers_list.append(ser)
 
         tasks = [ser.save(created_by=created_by) for ser in serializers_list]
+        self._notify_new_assignees([(t, list(t.assignees or [])) for t in tasks])
         return Response(TaskSerializer(tasks, many=True).data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["post"])

@@ -198,14 +198,17 @@ class SendMessageView(APIView):
         })
 
         # The websocket push above only reaches the recipient if their tab
-        # is actually open right now. If it isn't — site closed, browser
-        # closed, phone locked — is_user_online(recipient.id) is False and
-        # they'd otherwise never know a message arrived until they happen
-        # to open the app again. Web Push (same mechanism CallStartView
+        # is actually open right now. Web Push (same mechanism CallStartView
         # already uses for calls) wakes their device with an OS-level
         # notification even with nothing running, like WhatsApp does.
-        if not is_user_online(recipient.id):
-            send_new_message_push(recipient, message_data, request.user.name)
+        #
+        # It is sent ALWAYS now, not only when is_user_online() is False:
+        # an open-but-hidden tab (minimised window, other tab in front, phone
+        # locked but socket not dropped yet) counts as "online" and used to
+        # get no banner at all. The service worker (public/sw.js) drops the
+        # push when the app window is visible AND focused, so an active chat
+        # never gets a duplicate banner.
+        send_new_message_push(recipient, message_data, request.user.name)
 
         return Response(message_data, status=status.HTTP_201_CREATED)
 
@@ -381,17 +384,20 @@ class CallStartView(APIView):
 
         if callee_reachable:
             push_to_user(callee.id, {"type": "call.incoming", "call": call_data})
-        elif has_push:
+        if has_push:
             # Call stays RINGING (not MISSED) even with no live tab — it's
             # up to the caller's own ring-timeout to give up and call
             # CallEndView if the callee never opens the notification (see
             # callsApi.js / the frontend's ring-timeout, same as it
             # already does for an online-but-unanswered call).
+            #
+            # Also sent when the callee IS online: their tab may be hidden
+            # (other tab in front / minimised), where the in-page ring UI
+            # can't be seen. public/sw.js skips the banner when the app is
+            # visible and focused, so an open app only shows its own ringer.
             send_incoming_call_push(callee, call_data, request.user.name)
-        else:
-            # Neither a live tab nor a push subscription — nothing can
-            # possibly reach them, so record it missed immediately.
-            pass
+        # Neither a live tab nor a push subscription -> recorded MISSED
+        # immediately above (status=...MISSED), nothing more to do.
 
         return Response(call_data, status=status.HTTP_201_CREATED)
 

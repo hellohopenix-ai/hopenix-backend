@@ -92,3 +92,79 @@ def send_new_message_push(recipient, message_data, sender_name):
         "title": sender_name,
         "body": body,
     })
+
+
+def notify_user(user, payload: dict):
+    """One call = both delivery paths for a single notification:
+
+    1. websocket (push_to_user) — instant, lights the sidebar red dot if
+       the app is open in any tab/device of that user;
+    2. Web Push (send_web_push) — the OS-level "WhatsApp-style" banner on
+       phone/laptop, also when the site is closed. The service worker
+       (public/sw.js) skips showing it when the app is already open and
+       focused, so nobody gets a banner for something they are looking at.
+
+    Never raises — a failed notification must never break the request
+    (task save, module edit, ...) that triggered it."""
+    from .views import push_to_user  # lazy: views.py imports this module
+
+    try:
+        push_to_user(user.id, payload)
+    except Exception:  # noqa: BLE001
+        logger.exception("Websocket notify failed for user %s", user.id)
+    try:
+        send_web_push(user, payload)
+    except Exception:  # noqa: BLE001
+        logger.exception("Web push notify failed for user %s", user.id)
+
+
+def notify_tasks_assigned(assignments, assigner):
+    """`assignments` = iterable of (task, [display names newly added to it]).
+
+    Task.assignees stores display NAMES (not user ids), so people are
+    matched by User.name — the same matching the ?assignee= filter and the
+    Tasks page already use. One notification per person even when several
+    tasks were assigned in one go (bulk role-template create), and never
+    to the person who made the assignment."""
+    from django.contrib.auth import get_user_model
+
+    per_name = {}
+    for task, names in assignments:
+        for name in names:
+            per_name.setdefault(name, []).append(task)
+    if not per_name:
+        return
+
+    assigner_id = getattr(assigner, "id", None)
+    assigner_name = getattr(assigner, "name", "") or "Someone"
+    for user in get_user_model().objects.filter(name__in=list(per_name), is_active=True):
+        if user.id == assigner_id:
+            continue
+        tasks = per_name[user.name]
+        single = len(tasks) == 1
+        notify_user(user, {
+            "type": "task.assigned",
+            "taskId": tasks[0].id if single else None,
+            "title": "New task assigned",
+            "body": (
+                f'{assigner_name} assigned you "{tasks[0].title}"'
+                if single
+                else f"{assigner_name} assigned you {len(tasks)} tasks"
+            ),
+        })
+
+
+def notify_module_assigned(module, assigner):
+    """A project module (which also shows up as a task) got `module.assignee`
+    as its new assignee. No-op for self-assignment / no assignee."""
+    assignee = getattr(module, "assignee", None)
+    if assignee is None or assignee.id == getattr(assigner, "id", None):
+        return
+    assigner_name = getattr(assigner, "name", "") or "Someone"
+    project_name = getattr(module.project, "name", "") or "a project"
+    notify_user(assignee, {
+        "type": "task.assigned",
+        "taskId": None,
+        "title": "New task assigned",
+        "body": f'{assigner_name} assigned you "{module.name}" in {project_name}',
+    })

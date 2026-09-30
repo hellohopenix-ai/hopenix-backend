@@ -1,3 +1,5 @@
+import logging
+
 from django.shortcuts import get_object_or_404
 from django.http import FileResponse, Http404
 from django.utils import timezone
@@ -24,6 +26,7 @@ from .permissions import (
     ProjectObjectPermission,
 )
 from .utils import build_project_zip
+from messaging.push_utils import notify_module_assigned
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
@@ -233,6 +236,7 @@ class ModuleViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Not authorized to modify this project.")
         module = serializer.save(project=project)
         self._sync_module_task(module)
+        self._notify_assignee(module)
 
     # FIX (Add Client -> Task page never got the new module): creating a
     # Module here (e.g. ClientsPage.jsx's syncClientProjectToBackend,
@@ -324,6 +328,18 @@ class ModuleViewSet(viewsets.ModelViewSet):
             extra = dict(url_approved=False, url_approved_by=None, url_approved_at=None)
         module = serializer.save(**extra)
         self._mirror_module_to_tasks(module, old_status, old_assignee_name)
+        if module.assignee_id and module.assignee_id != getattr(old_assignee, "id", None):
+            self._notify_assignee(module)
+
+    def _notify_assignee(self, module):
+        """Sidebar dot + OS notification for the (new) module assignee.
+        Never allowed to fail the save."""
+        if not module.assignee_id:
+            return
+        try:
+            notify_module_assigned(module, self.request.user)
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception("Module-assignment notification failed")
 
     # FIX (module ticked on the Projects page never reached the Tasks page):
     # the Task -> Module direction already existed (TaskViewSet.
