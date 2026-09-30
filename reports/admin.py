@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import ActivityLog, CustomReport, DailyReport, DailyReportFile, ReportOverride
+from .models import ActivityLog, Asset, CustomReport, DailyReport, DailyReportFile, ReportOverride
 
 
 @admin.register(ActivityLog)
@@ -36,6 +36,13 @@ class DailyReportAdmin(admin.ModelAdmin):
     list_filter = ("status", "date")
     search_fields = ("user_name", "user_email", "note", "project")
     inlines = [DailyReportFileInline]
+
+
+@admin.register(Asset)
+class AssetAdmin(admin.ModelAdmin):
+    list_display = ("name", "category", "status", "assigned_to", "location", "purchase_date", "purchase_cost")
+    list_filter = ("category", "status")
+    search_fields = ("name", "asset_tag", "location")
 
 
 admin.site.register(ReportOverride)

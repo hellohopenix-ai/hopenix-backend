@@ -9,7 +9,7 @@ swap its localStorage reads for these responses with almost no reshaping.
 from rest_framework import serializers
 
 from .constants import MODULES, MODULE_TO_CATEGORY, TRACKABLE_ACTIONS
-from .models import ActivityLog, CustomReport
+from .models import ActivityLog, Asset, CustomReport
 
 
 def avatar_url(user, request):
@@ -98,6 +98,39 @@ def serialize_daily(report, request):
         "approvedAt": report.approved_at.isoformat() if report.approved_at else None,
         "approvedBy": (report.approved_by.name or report.approved_by.email) if report.approved_by else None,
     }
+
+
+def serialize_asset(asset, request):
+    assignee = asset.assigned_to
+    return {
+        "id": asset.id,
+        "name": asset.name,
+        "category": asset.category,
+        "assetTag": asset.asset_tag,
+        "status": asset.status,
+        "assignedToId": asset.assigned_to_id,
+        "assignedToName": (assignee.name or assignee.email) if assignee else "",
+        "assignedToAvatar": avatar_url(assignee, request),
+        "location": asset.location,
+        "purchaseDate": asset.purchase_date.isoformat() if asset.purchase_date else None,
+        "purchaseCost": str(asset.purchase_cost),
+        "notes": asset.notes,
+        "createdByName": (asset.created_by.name or asset.created_by.email) if asset.created_by else "",
+        "createdAt": asset.created_at.isoformat(),
+        "updatedAt": asset.updated_at.isoformat(),
+    }
+
+
+class AssetInputSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=255, trim_whitespace=True)
+    category = serializers.ChoiceField(choices=[c[0] for c in Asset.CATEGORY_CHOICES], default="Other")
+    assetTag = serializers.CharField(required=False, allow_blank=True, max_length=100, trim_whitespace=True)
+    status = serializers.ChoiceField(choices=[c[0] for c in Asset.STATUS_CHOICES], default="Available")
+    assignedTo = serializers.IntegerField(required=False, allow_null=True)
+    location = serializers.CharField(required=False, allow_blank=True, max_length=255, trim_whitespace=True)
+    purchaseDate = serializers.DateField(required=False, allow_null=True)
+    purchaseCost = serializers.DecimalField(required=False, max_digits=12, decimal_places=2, default=0)
+    notes = serializers.CharField(required=False, allow_blank=True, max_length=5000, trim_whitespace=True)
 
 
 class DailyReportInputSerializer(serializers.Serializer):

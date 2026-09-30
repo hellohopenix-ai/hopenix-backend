@@ -19,6 +19,10 @@ urlpatterns = [
     path("catalog/", views.CatalogView.as_view(), name="reports-catalog"),
     path("catalog/<str:key>/", views.CatalogItemView.as_view(), name="reports-catalog-item"),
 
+    # Company Assets ("Assets" module)
+    path("assets/", views.AssetListCreateView.as_view(), name="reports-assets"),
+    path("assets/<int:pk>/", views.AssetDetailView.as_view(), name="reports-asset-detail"),
+
     # Daily reports (photo/video proof). "files/" and "bulk-delete/" are listed
     # before <int:pk> so they can never be mistaken for an id.
     path("daily/", views.DailyReportListCreateView.as_view(), name="reports-daily"),

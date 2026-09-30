@@ -1,5 +1,4 @@
 import csv
-import logging
 import os
 import re
 from datetime import datetime, timedelta
@@ -21,15 +20,17 @@ from rest_framework.views import APIView
 
 from .catalog import build_catalog
 from .constants import MAX_DAILY_FILE_MB, MAX_DAILY_FILES, MODULE_TO_CATEGORY, MODULES
-from .models import ActivityLog, CustomReport, DailyReport, DailyReportFile, ReportOverride
+from .models import ActivityLog, Asset, CustomReport, DailyReport, DailyReportFile, ReportOverride
 from .permissions import ReportsStaffAccess, has_full_reports_access
 from .serializers import (
+    AssetInputSerializer,
     BulkDeleteSerializer,
     CatalogCreateSerializer,
     CatalogRenameSerializer,
     DailyReportInputSerializer,
     TrackSerializer,
     serialize_activity,
+    serialize_asset,
     serialize_daily,
     serialize_user_row,
 )
@@ -37,8 +38,6 @@ from .services import log_activity, user_label
 from .stats import activity_block, chart_data, currency_symbol, entity_stats, finance_stats, user_rows, workload
 from .uploads import validate_upload
 from .utils import RangeError, fill_days, get_tz, resolve_range
-
-logger = logging.getLogger(__name__)
 
 User = get_user_model()
 
@@ -417,6 +416,131 @@ class CatalogItemView(ReportsAPIView):
 
 
 # ==========================================================================
+# Company Assets ("Assets" module on the Reports page)
+# ==========================================================================
+
+
+def asset_queryset(request, full):
+    qs = Asset.objects.select_related("assigned_to", "assigned_to__profile", "created_by")
+    if not full:
+        # Non-admins only ever see assets assigned to them — same split as
+        # daily_queryset()/activity_queryset() above.
+        qs = qs.filter(assigned_to=request.user)
+    return qs
+
+
+class AssetListCreateView(ReportsAPIView):
+    """GET  /api/reports/assets/   filters: category, status, assignedTo, q
+    POST /api/reports/assets/   full access only — adds a new company asset."""
+
+    def get(self, request):
+        full = self.is_full(request)
+        p = request.query_params
+        qs = asset_queryset(request, full)
+
+        if p.get("category") and p["category"] != "All":
+            qs = qs.filter(category=p["category"])
+        if p.get("status") and p["status"] != "All":
+            qs = qs.filter(status=p["status"])
+        if p.get("assignedTo") and p["assignedTo"] != "All":
+            if p["assignedTo"] == "unassigned":
+                qs = qs.filter(assigned_to__isnull=True)
+            else:
+                try:
+                    qs = qs.filter(assigned_to_id=int(p["assignedTo"]))
+                except ValueError:
+                    raise ParseError("assignedTo must be a user id.")
+        q = (p.get("q") or "").strip()
+        if q:
+            qs = qs.filter(Q(name__icontains=q) | Q(asset_tag__icontains=q) | Q(location__icontains=q))
+
+        paginator = Pagination()
+        page = paginator.paginate_queryset(qs, request, view=self)
+        response = paginator.get_paginated_response([serialize_asset(a, request) for a in page])
+        response.data["scope"] = "all" if full else "own"
+        return response
+
+    def post(self, request):
+        self.require_full(request)
+        ser = AssetInputSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        d = ser.validated_data
+
+        assignee = None
+        if d.get("assignedTo"):
+            assignee = User.objects.filter(pk=d["assignedTo"]).first()
+            if assignee is None:
+                return Response({"error": "That user doesn't exist."}, status=status.HTTP_400_BAD_REQUEST)
+
+        asset = Asset.objects.create(
+            name=d["name"], category=d.get("category", "Other"), asset_tag=d.get("assetTag", ""),
+            status=d.get("status", "Available"), assigned_to=assignee, location=d.get("location", ""),
+            purchase_date=d.get("purchaseDate"), purchase_cost=d.get("purchaseCost") or 0,
+            notes=d.get("notes", ""), created_by=request.user,
+        )
+        log_activity(
+            action="create", user=request.user, module="Reports",
+            description=f"Added company asset \"{asset.name}\"",
+            object_type="asset", object_id=str(asset.id), object_repr=asset.name,
+        )
+        asset = asset_queryset(request, True).get(pk=asset.pk)
+        return Response(serialize_asset(asset, request), status=status.HTTP_201_CREATED)
+
+
+class AssetDetailView(ReportsAPIView):
+    """PATCH  /api/reports/assets/<id>/ — full access only.
+    DELETE /api/reports/assets/<id>/ — full access only."""
+
+    def _get(self, request, pk):
+        asset = asset_queryset(request, True).filter(pk=pk).first()
+        if asset is None:
+            raise NotFound("Asset not found.")
+        return asset
+
+    def patch(self, request, pk):
+        self.require_full(request)
+        asset = self._get(request, pk)
+        ser = AssetInputSerializer(data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+        d = ser.validated_data
+
+        if "assignedTo" in d:
+            if d["assignedTo"]:
+                assignee = User.objects.filter(pk=d["assignedTo"]).first()
+                if assignee is None:
+                    return Response({"error": "That user doesn't exist."}, status=status.HTTP_400_BAD_REQUEST)
+                asset.assigned_to = assignee
+            else:
+                asset.assigned_to = None
+        for field, attr in [
+            ("name", "name"), ("category", "category"), ("assetTag", "asset_tag"), ("status", "status"),
+            ("location", "location"), ("purchaseDate", "purchase_date"), ("purchaseCost", "purchase_cost"),
+            ("notes", "notes"),
+        ]:
+            if field in d:
+                setattr(asset, attr, d[field])
+        asset.save()
+        log_activity(
+            action="update", user=request.user, module="Reports",
+            description=f"Updated company asset \"{asset.name}\"",
+            object_type="asset", object_id=str(asset.id), object_repr=asset.name,
+        )
+        return Response(serialize_asset(asset, request))
+
+    def delete(self, request, pk):
+        self.require_full(request)
+        asset = self._get(request, pk)
+        name = asset.name
+        asset.delete()
+        log_activity(
+            action="delete", user=request.user, module="Reports",
+            description=f"Removed company asset \"{name}\"",
+            object_type="asset", object_id=str(pk), object_repr=name,
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ==========================================================================
 # Daily reports (with photo/video proof)
 # ==========================================================================
 
@@ -503,24 +627,13 @@ class DailyReportListCreateView(ReportsAPIView):
                         report=report, file=f, original_name=os.path.basename(f.name)[:255],
                         content_type=content_type, size=f.size, kind=kind,
                     ))
-        except Exception as exc:
+        except Exception:
             for obj in saved:  # don't leave bytes on disk for a report that rolled back
                 try:
                     obj.file.storage.delete(obj.file.name)
                 except Exception:
                     pass
-            # FIX (daily report upload failed with a bare "Request failed
-            # (500)" HTML page): a storage/Cloudinary problem used to bubble up
-            # as an unhandled 500, so neither the user nor the logs said why.
-            # Log the real error and answer with a JSON message the page shows.
-            logger.exception("Daily report file upload failed (user=%s)", user.pk)
-            reason = ""
-            if type(exc).__module__.startswith("cloudinary"):
-                reason = f" ({str(exc)[:200]})"  # e.g. "File size too large. Maximum is 10485760"
-            return Response(
-                {"error": f"The file server could not save your photo/video{reason}. Nothing was submitted — please try again."},
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
+            raise
 
         log_activity(
             action="create", user=user, module="Reports",

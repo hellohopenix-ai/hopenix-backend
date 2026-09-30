@@ -1,5 +1,4 @@
 import os
-import re
 import uuid
 
 from django.conf import settings
@@ -7,7 +6,6 @@ from django.db import models
 from django.utils import timezone
 
 from .constants import CATEGORIES
-from .storage import daily_report_storage
 
 
 class ActivityLog(models.Model):
@@ -95,19 +93,7 @@ def daily_report_file_path(instance, filename):
     # disk, only this relative path in Postgres (same pattern as
     # projects.module_file_path / expenses.expense_receipt_path).
     report = instance.report
-    # Videos get their own ".../video/" folder: the Cloudinary storage decides
-    # image-vs-video upload from that folder (see reports/cloud_storage.py).
-    folder = "video/" if getattr(instance, "kind", "") == "video" else ""
-    # FIX (phone file names broke the upload): gallery names like
-    # "WhatsApp Video 2026-09-29 at 10.15.32 AM.mp4" or "IMG #1 (2).jpg" made
-    # the stored path longer than the old 100-char column (and contain
-    # characters that upset the file server). Keep only safe characters and a
-    # short name here; the real, original name is kept in original_name.
-    stem, ext = os.path.splitext(os.path.basename(filename))
-    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", stem).strip("_")[:40] or "file"
-    ext = re.sub(r"[^A-Za-z0-9]", "", ext)[:6].lower()
-    safe_name = f"{stem}.{ext}" if ext else stem
-    return f"reports/daily/{report.user_id or 'anon'}/{report.date}/{folder}{uuid.uuid4()}_{safe_name}"
+    return f"reports/daily/{report.user_id or 'anon'}/{report.date}/{uuid.uuid4()}_{os.path.basename(filename)}"
 
 
 class DailyReport(models.Model):
@@ -152,7 +138,7 @@ class DailyReport(models.Model):
 
 class DailyReportFile(models.Model):
     report = models.ForeignKey(DailyReport, on_delete=models.CASCADE, related_name="files")
-    file = models.FileField(upload_to=daily_report_file_path, storage=daily_report_storage, max_length=255)
+    file = models.FileField(upload_to=daily_report_file_path)
     original_name = models.CharField(max_length=255)
     content_type = models.CharField(max_length=100, blank=True, default="")
     size = models.PositiveBigIntegerField(default=0)
@@ -181,6 +167,65 @@ class ReportOverride(models.Model):
 
     def __str__(self):
         return f"{self.key} ({'hidden' if self.hidden else self.custom_name or 'default'})"
+
+
+class Asset(models.Model):
+    """Company Assets module (Reports page): laptops, furniture, vehicles,
+    equipment, software licenses, etc. that the company owns. Optionally
+    assigned to one employee (assigned_to) — non-admin users on the Reports
+    page only ever see the assets assigned to them, admins/full-access see
+    every asset (mirrors DailyReport's own admin-vs-own split above).
+    """
+
+    CATEGORY_CHOICES = [
+        ("Laptop", "Laptop"),
+        ("Desktop", "Desktop"),
+        ("Mobile Phone", "Mobile Phone"),
+        ("Furniture", "Furniture"),
+        ("Vehicle", "Vehicle"),
+        ("Office Equipment", "Office Equipment"),
+        ("Software License", "Software License"),
+        ("Other", "Other"),
+    ]
+    STATUS_CHOICES = [
+        ("In Use", "In Use"),
+        ("Available", "Available"),
+        ("In Repair", "In Repair"),
+        ("Retired", "Retired"),
+    ]
+
+    name = models.CharField(max_length=255)
+    category = models.CharField(max_length=30, choices=CATEGORY_CHOICES, default="Other")
+    # Internal inventory / serial number — optional, not enforced unique so
+    # existing paper-trail numbers with duplicates can still be entered.
+    asset_tag = models.CharField(max_length=100, blank=True, default="")
+    status = models.CharField(max_length=15, choices=STATUS_CHOICES, default="Available")
+
+    assigned_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="assigned_assets"
+    )
+    location = models.CharField(max_length=255, blank=True, default="")
+
+    purchase_date = models.DateField(null=True, blank=True)
+    purchase_cost = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+
+    notes = models.TextField(blank=True, default="")
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["status"], name="asset_status_idx"),
+            models.Index(fields=["assigned_to"], name="asset_assignee_idx"),
+        ]
+
+    def __str__(self):
+        return self.name
 
 
 class CustomReport(models.Model):
