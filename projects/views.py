@@ -1,5 +1,6 @@
 import logging
 
+from django.core.files.base import ContentFile
 from django.shortcuts import get_object_or_404
 from django.http import FileResponse, Http404
 from django.utils import timezone
@@ -27,6 +28,167 @@ from .permissions import (
 )
 from .utils import build_project_zip
 from messaging.push_utils import notify_module_assigned
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Module -> Task mirror for FILES, ZIPs and the module LINK.
+#
+# Tasks created from a module (Task.module) used to learn about the module's
+# status and assignee (see ModuleViewSet._mirror_module_to_tasks) but NOT about
+# files / zips / the link attached to the module from the Projects page — so
+# they showed up on the Clients page (which reads the Module directly) but
+# never on the Tasks page / Zip Files page. The Task -> Module direction
+# already existed (TaskViewSet.upload_file_attachment / upload_zip / complete),
+# this is the missing reverse direction.
+#
+# NO-OVERRIDE RULE (same as the status mirror): only the one file / link that
+# really changed is added or removed, everything else on the task is kept, and
+# queryset.update() is used on purpose so TaskViewSet.perform_update is not
+# triggered and the two sides can never ping-pong. These helpers are also only
+# called from the Projects-side viewsets — the Task-side endpoints create their
+# ModuleFile rows through the ORM directly, so they never re-enter here.
+# ---------------------------------------------------------------------------
+def _file_kind(name, mime):
+    mime = (mime or "").lower()
+    lower = (name or "").lower()
+    if mime.startswith("image/"):
+        return "image"
+    if mime.startswith("video/"):
+        return "video"
+    if lower.endswith(".zip") or mime in ("application/zip", "application/x-zip-compressed"):
+        return "zip"
+    return "file"
+
+
+def _norm_url(u):
+    return str(u or "").strip().rstrip("/")
+
+
+def mirror_module_file_to_tasks(module_file, request):
+    from tasks.models import Task, TaskZipFile
+
+    now = timezone.now()
+    kind = _file_kind(module_file.original_name, module_file.mime_type)
+    for task in Task.objects.filter(module_id=module_file.module_id):
+        entries = list(task.attachments or [])
+        if any(
+            isinstance(e, dict)
+            and (str(e.get("id", "")) == str(module_file.id) or e.get("moduleFileId") == module_file.id)
+            for e in entries
+        ):
+            continue  # already mirrored
+
+        entry = None
+        if kind == "zip":
+            # Same as TaskViewSet.upload_zip: a real TaskZipFile, so the
+            # Tasks page can download it and the Zip Files page lists it.
+            try:
+                module_file.file.open("rb")
+                try:
+                    data = module_file.file.read()
+                finally:
+                    module_file.file.close()
+                zip_row = TaskZipFile.objects.create(
+                    task=task,
+                    file=ContentFile(data, name=module_file.original_name),
+                    original_name=module_file.original_name,
+                    size=module_file.size or len(data),
+                    uploaded_by=request.user,
+                )
+                entry = {
+                    "type": "zip",
+                    "name": module_file.original_name,
+                    "zipFileId": zip_row.id,
+                    "moduleFileId": module_file.id,
+                    "addedAt": now.isoformat(),
+                }
+            except Exception:  # noqa: BLE001
+                logger.exception("Module zip -> task zip mirror failed (module file %s)", module_file.id)
+        if entry is None:
+            entry = {
+                "id": module_file.id,
+                "type": "file" if kind == "zip" else kind,
+                "name": module_file.original_name,
+                "url": request.build_absolute_uri(module_file.file.url),
+                "addedAt": now.isoformat(),
+            }
+        Task.objects.filter(pk=task.pk).update(attachments=[*entries, entry], updated_at=now)
+
+
+def unmirror_module_file_from_tasks(module_file):
+    """Deleting a file from the Projects page removes it from the module's
+    tasks too (and deletes the TaskZipFile copy made for a zip)."""
+    from tasks.models import Task, TaskZipFile
+
+    now = timezone.now()
+    is_zip_name = (module_file.original_name or "").lower().endswith(".zip")
+    for task in Task.objects.filter(module_id=module_file.module_id):
+        keep, changed = [], False
+        for e in task.attachments or []:
+            if not isinstance(e, dict):
+                keep.append(e)
+                continue
+            same = str(e.get("id", "")) == str(module_file.id) or e.get("moduleFileId") == module_file.id
+            same_zip = (
+                is_zip_name
+                and e.get("type") == "zip"
+                and e.get("zipFileId") not in (None, "")
+                and e.get("name") == module_file.original_name
+            )
+            if not (same or same_zip):
+                keep.append(e)
+                continue
+            changed = True
+            zid = str(e.get("zipFileId", "")).replace("task-", "", 1)
+            if zid.isdigit():
+                zip_row = TaskZipFile.objects.filter(pk=int(zid), task=task).first()
+                if zip_row:
+                    zip_row.file.delete(save=False)
+                    zip_row.delete()
+        if changed:
+            Task.objects.filter(pk=task.pk).update(attachments=keep, updated_at=now)
+
+
+def mirror_module_url_to_tasks(module, old_url):
+    """Module.url is ONE link (last one wins). Keep the module's tasks in
+    step: the old link entry is swapped for the new one, or removed when the
+    link was cleared."""
+    from tasks.models import Task
+
+    new_url = (module.url or "").strip()
+    old_url = (old_url or "").strip()
+    if _norm_url(new_url) == _norm_url(old_url):
+        return
+    now = timezone.now()
+    for task in Task.objects.filter(module=module):
+        entries = [
+            e for e in (task.attachments or [])
+            if not (
+                isinstance(e, dict) and e.get("type") == "link" and old_url
+                and _norm_url(e.get("url")) == _norm_url(old_url)
+            )
+        ]
+        if new_url and not any(
+            isinstance(e, dict) and e.get("type") == "link" and _norm_url(e.get("url")) == _norm_url(new_url)
+            for e in entries
+        ):
+            entries.append({
+                "id": f"modlink-{module.id}-{int(now.timestamp())}",
+                "type": "link",
+                "name": new_url,
+                "url": new_url,
+                "uploadedAt": now.isoformat(),
+                "addedAt": now.isoformat(),
+            })
+        fields = {"attachments": entries, "updated_at": now}
+        if new_url:
+            fields["attachment"] = new_url
+        elif _norm_url(task.attachment) == _norm_url(old_url):
+            fields["attachment"] = ""
+        Task.objects.filter(pk=task.pk).update(**fields)
+
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
@@ -236,6 +398,11 @@ class ModuleViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Not authorized to modify this project.")
         module = serializer.save(project=project)
         self._sync_module_task(module)
+        if module.url:
+            try:
+                mirror_module_url_to_tasks(module, "")
+            except Exception:  # noqa: BLE001
+                logger.exception("Module link -> task mirror failed")
         self._notify_assignee(module)
 
     # FIX (Add Client -> Task page never got the new module): creating a
@@ -320,6 +487,7 @@ class ModuleViewSet(viewsets.ModelViewSet):
         # employee could swap an already-approved URL for a different one
         # and it would stay live on the Portal unreviewed.
         instance = serializer.instance
+        old_url = instance.url
         old_status = instance.status
         old_assignee = instance.assignee
         old_assignee_name = getattr(old_assignee, "name", "") or ""
@@ -328,6 +496,10 @@ class ModuleViewSet(viewsets.ModelViewSet):
             extra = dict(url_approved=False, url_approved_by=None, url_approved_at=None)
         module = serializer.save(**extra)
         self._mirror_module_to_tasks(module, old_status, old_assignee_name)
+        try:
+            mirror_module_url_to_tasks(module, old_url)
+        except Exception:  # noqa: BLE001
+            logger.exception("Module link -> task mirror failed")
         if module.assignee_id and module.assignee_id != getattr(old_assignee, "id", None):
             self._notify_assignee(module)
 
@@ -442,7 +614,7 @@ class ModuleFileViewSet(viewsets.ModelViewSet):
         if not file_obj:
             raise ValidationError("No file uploaded.")
 
-        serializer.save(
+        module_file = serializer.save(
             module=self.get_module(),
             file=file_obj,
             original_name=file_obj.name,
@@ -450,11 +622,19 @@ class ModuleFileViewSet(viewsets.ModelViewSet):
             size=file_obj.size,
             uploaded_by=self.request.user,
         )
+        try:
+            mirror_module_file_to_tasks(module_file, self.request)
+        except Exception:  # noqa: BLE001
+            logger.exception("Module file -> task mirror failed")
 
     def perform_destroy(self, instance):
         project = self.get_project()
         if not can_manage_project(self.request.user, project):
             raise PermissionDenied("Not authorized to modify this project.")
+        try:
+            unmirror_module_file_from_tasks(instance)
+        except Exception:  # noqa: BLE001
+            logger.exception("Module file -> task un-mirror failed")
         instance.file.delete(save=False)
         instance.delete()
 
