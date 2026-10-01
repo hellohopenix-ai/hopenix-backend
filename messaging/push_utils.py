@@ -42,7 +42,7 @@ from .models import PushSubscription
 logger = logging.getLogger(__name__)
 
 # A few threads are plenty: each job is just one HTTPS POST per device.
-_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="webpush")
+_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="webpush")
 
 # When the push service answers 404/410 the browser-side registration is dead.
 # The row is deleted, but the browser itself may keep handing the SAME dead
@@ -140,7 +140,7 @@ def _deliver(subs, payload: dict, email: str = "") -> dict:
                 # "high" makes Android deliver straight away even in battery
                 # saving (Doze) instead of batching the push for later.
                 headers={"Urgency": "high"},
-                timeout=10,  # never let a slow push service hang for long
+                timeout=6,  # never let a slow push service hold up the other notifications
             )
             out["delivered"] += 1
         except WebPushException as exc:
