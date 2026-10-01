@@ -17,6 +17,14 @@ def resolve_avatar_url(user, request):
     profile = getattr(user, "profile", None)
     source = user.avatar or (profile.profile_photo if profile else None)
     if not source:
+        # A client's portal User has no photo of its own — fall back to the
+        # photo set on the Client record (Clients page / Profile Settings).
+        client = getattr(user, "client_profile", None)
+        if client and client.avatar:
+            source = client.avatar
+        elif client and client.avatar_url:
+            return client.avatar_url
+    if not source:
         return ""
     url = source.url
     full_url = request.build_absolute_uri(url) if request else url

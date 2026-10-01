@@ -602,6 +602,11 @@ class DashboardNotificationsView(APIView):
         user = request.user
         _deny_clients(user)
 
+        # Bell is admin-only: everyone else gets an empty feed, so no activity
+        # / confidential info is ever exposed to employees or managers.
+        if getattr(user, "role", None) != "admin":
+            return Response([])
+
         try:
             limit = max(1, min(int(request.query_params.get("limit", 30)), 50))
         except (TypeError, ValueError):

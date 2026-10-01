@@ -161,8 +161,18 @@ def get_allowed_contacts(user):
     """
     base = User.objects.filter(status="approved").exclude(id=user.id).exclude(role="client")
 
+    # CLIENT PORTAL MESSAGING: a client (portal login, role="client") can see
+    # and message ADMINS ONLY — never employees/managers/other clients.
+    if user.role == "client":
+        return User.objects.filter(status="approved", is_active=True, role="admin").exclude(id=user.id)
+
+    # Admin: every approved staff user PLUS every client who has a portal
+    # login, so client messages show up on the admin's Messages page and the
+    # admin can reply. (Managers/employees still never see clients.)
     if user.role == "admin":
-        return base
+        return User.objects.filter(status="approved").exclude(id=user.id).filter(
+            ~Q(role="client") | Q(role="client", is_active=True, client_profile__isnull=False)
+        )
 
     project_ids = _project_teammate_ids(user)
     client_ids = _client_manager_ids(user)
