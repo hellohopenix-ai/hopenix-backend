@@ -457,3 +457,25 @@ def notify_project_assigned(project, users, assigner):
             "title": "Added to a project",
             "body": body,
         }, email_subject="Added to a project", email_body=body)
+
+
+def notify_staff_client_message(client, text, subject=""):
+    """A CLIENT wrote in their portal (Messages tab or Support form) — tell
+    the admins with a phone/laptop banner, also when Hopenix is closed.
+    Never raises: a failed push must never break saving the message."""
+    try:
+        from settings.notify import admin_users
+
+        text = (text or "").strip() or "Sent a message"
+        body = text if len(text) <= 140 else text[:137] + "..."
+        title = f"{client.name}: {subject}" if subject else (client.name or "Client message")
+        for admin in admin_users():
+            notify_user(admin, {
+                "type": "client.message.in",
+                "title": title,
+                "body": body,
+                "tag": f"client-in-{client.id}",
+                "url": "/dashboard?tab=Clients",
+            })
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not notify staff about a client message")

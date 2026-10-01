@@ -1395,7 +1395,10 @@ class ClientMessageViewSet(viewsets.ModelViewSet):
             client_profile = getattr(user, "client_profile", None)
             if not client_profile:
                 raise PermissionDenied("Portal access isn't linked to a client account.")
-            serializer.save(client=client_profile, sender="client")
+            message = serializer.save(client=client_profile, sender="client")
+            from messaging.push_utils import notify_staff_client_message
+
+            notify_staff_client_message(client_profile, getattr(message, "text", ""))
         else:
             message = serializer.save(sender="admin", created_by=user)
             # Phone/laptop banner for the client on their portal login (also when the portal is closed).
@@ -1425,6 +1428,9 @@ class SupportRequestView(APIView):
             return Response({"detail": "Please describe what's going on."}, status=status.HTTP_400_BAD_REQUEST)
 
         ClientMessage.objects.create(client=client, sender="client", kind="support", subject=subject, text=message)
+        from messaging.push_utils import notify_staff_client_message
+
+        notify_staff_client_message(client, message, subject)
         log_activity(client, "Support request sent")
 
         support_email = getattr(dj_settings, "SUPPORT_EMAIL", dj_settings.EMAIL_HOST_USER)
