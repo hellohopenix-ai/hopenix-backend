@@ -121,6 +121,14 @@ def _loop():
             send_birthday_notifications()
         except Exception:  # noqa: BLE001
             logger.exception("Birthday notification pass failed")
+        # Release this background thread's DB connection between passes so it
+        # doesn't sit idle holding one of Postgres' limited connection slots.
+        try:
+            from django.db import connection
+
+            connection.close()
+        except Exception:  # noqa: BLE001
+            pass
         time.sleep(60)
 
 
