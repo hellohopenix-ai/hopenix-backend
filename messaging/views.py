@@ -270,6 +270,116 @@ class MessageReactView(APIView):
         return Response(message_data)
 
 
+def _purge_message_files(messages):
+    """Removes the attachment files (images/files/voice notes) of the given
+    messages from storage, so a permanent delete really frees the space and
+    leaves nothing behind. Never raises — a missing file must not block the
+    database delete."""
+    for m in messages:
+        if m.attachment:
+            try:
+                m.attachment.delete(save=False)
+            except Exception:  # noqa: BLE001
+                logger.exception("Could not remove attachment file of message %s", m.id)
+
+
+class MessageDeleteView(APIView):
+    """DELETE /api/messages/messages/<id>/
+    Permanently deletes ONE message (row + attachment file + its reactions)
+    for everyone in the conversation. Any participant of the conversation can
+    do it (same as the delete button in the Messages page). Both sides'
+    open threads update live via a \"message.deleted\" websocket event."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def delete(self, request, message_id):
+        request.user.touch_active()
+        try:
+            msg = Message.objects.select_related("conversation").get(id=message_id)
+        except Message.DoesNotExist:
+            return Response({"error": "Message not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        conv = msg.conversation
+        if not conv.memberships.filter(user=request.user).exists():
+            return Response(
+                {"error": "You are not part of this conversation."}, status=status.HTTP_403_FORBIDDEN
+            )
+
+        participant_ids = list(conv.memberships.values_list("user_id", flat=True))
+        _purge_message_files([msg])
+        msg.delete()
+
+        # An unread message that no longer exists must not keep the unread
+        # badge counting it.
+        if conv.type == Conversation.DIRECT:
+            for membership in conv.memberships.all():
+                unread = Message.objects.filter(
+                    conversation=conv, recipient_id=membership.user_id, is_read=False
+                ).count()
+                if membership.unread_count != unread:
+                    membership.unread_count = unread
+                    membership.save(update_fields=["unread_count"])
+
+        event = {"type": "message.deleted", "conversation_id": conv.id, "message_id": message_id}
+        for target_id in participant_ids:
+            try:
+                push_to_user(target_id, event)
+            except Exception:  # noqa: BLE001
+                logger.exception("Websocket message.deleted to user %s failed", target_id)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ConversationDeleteView(APIView):
+    """DELETE /api/messages/conversations/<id>/
+    Permanently deletes a whole chat: every message in it (rows, attachment
+    files, reactions) and its finished call history are removed from the
+    database for everyone. The empty conversation is then hidden from the
+    inbox of both people; it only comes back (empty) if somebody sends a new
+    message, exactly like before."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def delete(self, request, conversation_id):
+        request.user.touch_active()
+        try:
+            conv = Conversation.objects.get(id=conversation_id)
+        except Conversation.DoesNotExist:
+            return Response({"error": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not conv.memberships.filter(user=request.user).exists():
+            return Response(
+                {"error": "You are not part of this conversation."}, status=status.HTTP_403_FORBIDDEN
+            )
+
+        participant_ids = list(conv.memberships.values_list("user_id", flat=True))
+
+        msgs = list(Message.objects.filter(conversation=conv).only("id", "attachment"))
+        _purge_message_files(msgs)
+        Message.objects.filter(conversation=conv).delete()
+
+        # Finished calls between the two people belong to this chat's
+        # history too (the thread shows them inline). A call that is
+        # ringing/ongoing right now is left alone.
+        finished = Call.objects.exclude(status__in=[Call.RINGING, Call.ONGOING])
+        if conv.type == Conversation.DIRECT and len(participant_ids) == 2:
+            a, b = participant_ids
+            finished.filter(
+                models.Q(caller_id=a, callee_id=b) | models.Q(caller_id=b, callee_id=a)
+            ).delete()
+        else:
+            finished.filter(conversation=conv).delete()
+
+        Participant.objects.filter(conversation=conv).update(hidden=True, unread_count=0)
+
+        event = {"type": "conversation.deleted", "conversation_id": conv.id}
+        for target_id in participant_ids:
+            try:
+                push_to_user(target_id, event)
+            except Exception:  # noqa: BLE001
+                logger.exception("Websocket conversation.deleted to user %s failed", target_id)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 class MarkThreadReadView(APIView):
     """POST /api/messages/thread/<user_id>/read/
     Marks all messages from <user_id> to request.user as read."""

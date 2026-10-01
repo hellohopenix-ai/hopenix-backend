@@ -8,6 +8,9 @@ urlpatterns = [
     path("thread/<int:user_id>/read/", views.MarkThreadReadView.as_view(), name="msg-thread-read"),
     path("send/", views.SendMessageView.as_view(), name="msg-send"),
     path("messages/<int:message_id>/react/", views.MessageReactView.as_view(), name="msg-react"),
+    # Permanent delete (one message / a whole chat) — see MessageDeleteView / ConversationDeleteView.
+    path("messages/<int:message_id>/", views.MessageDeleteView.as_view(), name="msg-delete"),
+    path("conversations/<int:conversation_id>/", views.ConversationDeleteView.as_view(), name="msg-conversation-delete"),
 
     # Calls (audio/video, signalled over the same per-user websocket
     # messages already use — see messaging/consumers.py + views.py).
