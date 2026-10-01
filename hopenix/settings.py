@@ -149,11 +149,11 @@ CHANNEL_LAYERS = {
 DATABASE_URL = config('DATABASE_URL', default='')
 if DATABASE_URL:
     DATABASES = {
-        # conn_max_age MUST be 0 under Daphne/ASGI: every request runs in its
-        # own short-lived thread, and persistent (600s) connections opened in
-        # those threads are never reused/closed, so they pile up until
-        # Postgres says "FATAL: sorry, too many clients already" (login 500s,
-        # failed deploys/migrations). 0 = close the connection after each request.
+        # conn_max_age MUST be 0 under Daphne/ASGI: every request (and every
+        # webpush/reminder worker thread) opens its own connection, and
+        # persistent 600s connections are never reused/closed, so they pile up
+        # until Postgres says "FATAL: sorry, too many clients already"
+        # (login 500s, failed deploys/migrations). 0 = close after each request.
         'default': dj_database_url.parse(DATABASE_URL, conn_max_age=0),
     }
 else:
