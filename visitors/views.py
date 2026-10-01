@@ -6,7 +6,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 
-from users.access import ModuleAccess
+from users.access import ModuleAccess, can_access_page, role_category
 
 from .models import Visitor, VisitorStatus
 from .permissions import can_approve_visitors, can_delete_visitor, can_edit_visitor
@@ -50,6 +50,16 @@ def _notify_admins_of_visitor(visitor, request):
             continue
 
 
+class _HasVisitorsPage(permissions.BasePermission):
+    message = "You do not have access to the Visitors page."
+
+    def has_permission(self, request, view):
+        user = request.user
+        if role_category(getattr(user, "role", None)) == "client":
+            return False
+        return can_access_page(user, "Visitors")
+
+
 class VisitorViewSet(viewsets.ModelViewSet):
     """Full CRUD for VisitorsPage.jsx, plus the decide/wait/reopen actions
     the Host Approval panel needs beyond plain field edits — mirrors
@@ -69,6 +79,16 @@ class VisitorViewSet(viewsets.ModelViewSet):
     serializer_class = VisitorSerializer
     permission_classes = [permissions.IsAuthenticated, ModuleAccess]
     lookup_field = "code"
+
+    def get_permissions(self):
+        # Anyone who has been given the Visitors page (manager, or an
+        # employee the admin granted it to) can REGISTER a visitor and so
+        # send the approval request to the admin, even if their module row
+        # for Visitors is view-only (the employee default). Approving /
+        # rejecting stays admin-only (_require_admin below).
+        if getattr(self, "action", None) == "create":
+            return [permissions.IsAuthenticated(), _HasVisitorsPage()]
+        return super().get_permissions()
 
     def get_queryset(self):
         qs = Visitor.objects.select_related("created_by", "reviewed_by").all()

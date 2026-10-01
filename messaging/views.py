@@ -306,6 +306,59 @@ class ContactsView(APIView):
         contacts = get_allowed_contacts(request.user)
         return Response(ContactSerializer(contacts, many=True, context={"request": request}).data)
 
+def _callee_sim_number(user):
+    """The cell number the person typed when they registered / completed their
+    profile (users.Profile.phone). Empty string if they never filled one."""
+    try:
+        return (user.profile.phone or "").strip()
+    except Exception:  # noqa: BLE001 - no Profile row yet
+        return ""
+
+
+def send_offline_call_notice(call, request):
+    """Caller tried to call someone who is not on the website/app (no live
+    connection, e.g. their internet is off). Drop an automatic text into the
+    caller's chat with that person containing the cell number they registered
+    with, so the caller can ring them on a normal SIM call instead.
+
+    Sent at most once per call (cache guard), never raises, and returns the
+    number (or "") so the API response can show it as a toast as well."""
+    callee = call.callee
+    phone = _callee_sim_number(callee)
+    if not phone:
+        return ""
+    guard_key = f"offline-call-notice-{call.id}"
+    if not cache.add(guard_key, True, timeout=300):
+        return phone  # already sent for this call
+    try:
+        text = f"{callee.name or 'This user'} is not available on website app, so call on SIM number: {phone}"
+        conv = call.conversation
+        # Shown in the caller's chat as an unread message from that person.
+        msg = Message.objects.create(
+            conversation=conv, sender=callee, recipient=call.caller, kind=Message.TEXT, text=text
+        )
+        conv.updated_at = timezone.now()
+        conv.save(update_fields=["updated_at"])
+        Participant.objects.filter(conversation=conv, user=call.caller).update(
+            hidden=False, unread_count=models.F("unread_count") + 1
+        )
+        Participant.objects.filter(conversation=conv, user=callee).update(hidden=False)
+        message_data = MessageSerializer(msg, context={"request": request}).data
+        event = {
+            "type": "message.new", "conversation_id": conv.id,
+            "sender_id": callee.id, "recipient_id": call.caller_id,
+            "message": message_data,
+        }
+        for target_id in (call.caller_id, callee.id):
+            try:
+                push_to_user(target_id, event)
+            except Exception:  # noqa: BLE001
+                logger.exception("Websocket message.new to user %s failed", target_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not send offline-call notice for call %s", call.id)
+    return phone
+
+
 class CallStartView(APIView):
     """POST /api/messages/calls/start/
     Body: { calleeId: <user_id>, callType?: "audio"|"video" }
@@ -401,6 +454,11 @@ class CallStartView(APIView):
 
         call_data = CallSerializer(call, context={"request": request}).data
 
+        # Nobody to ring at all (no live tab, no push device) -> the call is
+        # MISSED right now; hand the caller the callee's SIM number instead.
+        if call.status == Call.MISSED:
+            call_data["fallbackPhone"] = send_offline_call_notice(call, request)
+
         if callee_reachable:
             push_to_user(callee.id, {"type": "call.incoming", "call": call_data})
         if has_push:
@@ -493,6 +551,12 @@ class CallEndView(APIView):
         call_data = CallSerializer(call, context={"request": request}).data
         other_id = call.callee_id if request.user.id == call.caller_id else call.caller_id
         push_to_user(other_id, {"type": "call.ended", "call": call_data})
+
+        # Caller gave up while it was ringing and the callee still has no live
+        # connection (offline / internet off): the push never reached them, so
+        # send the caller the callee's SIM number as an automatic message.
+        if was_ringing and request.user.id == call.caller_id and not is_user_online(call.callee_id):
+            call_data["fallbackPhone"] = send_offline_call_notice(call, request)
 
         # Caller hung up / gave up while it was still ringing -> the callee
         # missed it. Notify them WhatsApp-style (also when the site is closed).
