@@ -22,4 +22,6 @@ urlpatterns = [
     # still ring a user when their tab/browser is fully closed.
     path("push/subscribe/", views.PushSubscribeView.as_view(), name="push-subscribe"),
     path("push/unsubscribe/", views.PushUnsubscribeView.as_view(), name="push-unsubscribe"),
+    # In-app "is my notification working?" check (see PushTestView).
+    path("push/test/", views.PushTestView.as_view(), name="push-test"),
 ]

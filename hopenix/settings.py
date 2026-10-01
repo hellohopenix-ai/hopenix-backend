@@ -284,9 +284,24 @@ SUPPORT_EMAIL = config('SUPPORT_EMAIL', default='')
 #   npx web-push generate-vapid-keys
 # then put PUBLIC key here AND in the frontend's pushSubscription.js, and
 # the PRIVATE key here only (add both to your .env, same as DB_* above).
-VAPID_PUBLIC_KEY = config('VAPID_PUBLIC_KEY', default='')
-VAPID_PRIVATE_KEY = config('VAPID_PRIVATE_KEY', default='')
+
+
+def _clean_vapid(value):
+    # Hosting dashboards (Railway etc.) easily end up with the key wrapped in
+    # quotes, followed by a space / newline, or with literal "\n" text. Any of
+    # those makes the VAPID signing fail and NO notification is ever sent, so
+    # strip them here instead of failing silently.
+    value = (value or '').strip().strip('"').strip("'").strip()
+    return value.replace('\\n', '\n').strip()
+
+
+VAPID_PUBLIC_KEY = _clean_vapid(config('VAPID_PUBLIC_KEY', default=''))
+VAPID_PRIVATE_KEY = _clean_vapid(config('VAPID_PRIVATE_KEY', default=''))
 VAPID_CLAIMS = {'sub': 'mailto:' + (SUPPORT_EMAIL or config('EMAIL_HOST_USER', default='admin@example.com'))}
+
+# True = send web pushes on the calling thread (used by tests). Normal runs
+# send them on a background thread, see messaging/push_utils.py.
+WEBPUSH_SYNC = config('WEBPUSH_SYNC', default=False, cast=bool)
 
 # Reports / activity log (see reports/).
 # Set True only if you run behind a proxy (nginx etc.) that sets X-Forwarded-For; otherwise

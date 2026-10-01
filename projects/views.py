@@ -690,8 +690,17 @@ class ModuleFileViewSet(viewsets.ModelViewSet):
         if isinstance(approved, str):
             approved = approved.strip().lower() not in ("false", "0", "no", "")
         approved = bool(approved)
+        was_approved = ModuleFile.objects.filter(pk=module_file.pk, approved=True).exists()
         module_file.approved = approved
         module_file.approved_by = request.user if approved else None
         module_file.approved_at = timezone.now() if approved else None
         module_file.save(update_fields=["approved", "approved_by", "approved_at"])
+        if approved and not was_approved:
+            # Newly visible on the Client Portal -> tell that project's client.
+            try:
+                from messaging.push_utils import notify_module_file_approved
+
+                notify_module_file_approved(module_file)
+            except Exception:  # noqa: BLE001 - never break approving because a push failed
+                pass
         return Response(ModuleFileSerializer(module_file, context={"request": request}).data)

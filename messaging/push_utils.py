@@ -8,11 +8,29 @@ Requires:  pip install pywebpush --break-system-packages
 Requires VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY / VAPID_CLAIMS in settings.py
 (see hopenix/settings.py — generate a keypair with
 `npx web-push generate-vapid-keys` and paste the values in).
+
+CHANGES in this version
+  * The HTTP call to the push service (Google FCM etc.) now runs on a small
+    background thread pool. Before, it ran INSIDE the request that sent the
+    message / assigned the task, so a slow push service made the sender wait
+    up to 10 s per device.
+  * send_web_push() now RETURNS a summary (how many devices, how many
+    accepted, which errors) instead of nothing, and describe_push_setup()
+    reports the server-side state. The new /api/messages/push/test/
+    endpoint uses both so "why don't I get notifications" can be answered
+    from the app instead of from server logs.
+  * Task assignment matches people by name case-insensitively and ignoring
+    stray spaces ("ali khan " == "Ali Khan").
 """
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 
 from django.conf import settings
+from django.core.cache import cache
+from django.db import close_old_connections
+
 try:
     from pywebpush import WebPushException, webpush
 except ImportError:
@@ -23,64 +41,183 @@ from .models import PushSubscription
 
 logger = logging.getLogger(__name__)
 
+# A few threads are plenty: each job is just one HTTPS POST per device.
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="webpush")
 
-def send_web_push(user, payload: dict):
-    """Pushes `payload` (JSON-serializable) to every device/browser `user`
-    has subscribed on. Silently drops subscriptions the browser has since
-    revoked (410 Gone / 404 Not Found) by deleting them, so dead endpoints
-    don't pile up. Never raises — a push failure should never break the
-    call/message flow that triggered it (the websocket/REST path still works).
+# When the push service answers 404/410 the browser-side registration is dead.
+# The row is deleted, but the browser itself may keep handing the SAME dead
+# endpoint back on every app start — which the app would happily save again,
+# and push would stay broken forever. So dead endpoints are remembered for a
+# while and PushSubscribeView answers 409 "stale" for them; the frontend
+# (pushSubscription.js) then drops its old subscription and creates a fresh one.
+DEAD_ENDPOINT_TTL = 60 * 60 * 24 * 30
 
-    Every failure is written to the server log with the push service's own
-    answer, so "why didn't the notification arrive" can be read straight from
-    the Railway logs."""
+
+def dead_endpoint_key(endpoint: str) -> str:
+    import hashlib
+
+    return "push-dead:" + hashlib.sha1((endpoint or "").encode("utf-8")).hexdigest()
+
+
+def _device_label(endpoint: str) -> str:
+    """Human name of the push service behind a subscription endpoint, only
+    used in diagnostics / logs (never sent anywhere)."""
+    host = urlparse(endpoint or "").netloc.lower()
+    if "googleapis.com" in host:
+        return "Chrome (Android / laptop)"
+    if "mozilla" in host:
+        return "Firefox"
+    if "apple.com" in host:
+        return "Safari / iPhone"
+    if "notify.windows.com" in host:
+        return "Edge (Windows)"
+    return host or "unknown device"
+
+
+def _for_recipient(user, payload: dict) -> dict:
+    """Client Portal users must land in the PORTAL when they tap a
+    notification, not in the staff /dashboard. The service worker (sw.js)
+    opens payload["url"] when it is present; staff payloads keep using the
+    built-in per-type routing there."""
+    if getattr(user, "role", "") != "client" or payload.get("url"):
+        return payload
+    kind = str(payload.get("type") or "")
+    if kind.startswith("project."):
+        view = "projects"
+    elif kind == "test" or kind.startswith("birthday."):
+        view = ""
+    else:  # chat messages, calls, thread replies
+        view = "messages"
+    return {**payload, "url": "/client-portal" + (f"?view={view}" if view else "")}
+
+
+def _config_problem() -> str:
+    """'' when the server can send pushes, else a plain-English reason."""
     if webpush is None:
-        logger.error("Web push NOT sent: the pywebpush package is not installed.")
-        return
+        return "The pywebpush package is not installed on the server (pip install pywebpush)."
     if not getattr(settings, "VAPID_PRIVATE_KEY", ""):
-        logger.error("Web push NOT sent: VAPID_PRIVATE_KEY is empty. Set it in the Railway variables.")
-        return
+        return "VAPID_PRIVATE_KEY is empty on the server. Set VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY in the server (Railway) variables."
+    if not getattr(settings, "VAPID_PUBLIC_KEY", ""):
+        return "VAPID_PUBLIC_KEY is empty on the server. Set it in the server (Railway) variables."
+    return ""
 
+
+def describe_push_setup(user) -> dict:
+    """Server-side state for one user, for the in-app notification check."""
+    problem = _config_problem()
+    subs = list(PushSubscription.objects.filter(user=user).order_by("-created_at"))
+    return {
+        "configured": not problem,
+        "reason": problem,
+        "subscriptions": len(subs),
+        "devices": [
+            {"id": s.id, "device": _device_label(s.endpoint), "since": s.created_at.isoformat()}
+            for s in subs
+        ],
+    }
+
+
+def _deliver(subs, payload: dict, email: str = "") -> dict:
+    """Blocking: POSTs `payload` to every subscription in `subs`. Deletes
+    subscriptions the push service says are gone (404 / 410). Never raises."""
     # Calls are only worth ringing for a short while; everything else may wait.
     ttl = 45 if payload.get("type") == "call.incoming" else 86400
-    # Calls / messages should wake the phone immediately; everything else
-    # (task, project) is normal urgency.
-    subs = list(PushSubscription.objects.filter(user=user))
-    if not subs:
-        logger.info("Web push skipped for %s: no subscribed device (Enable was never accepted on a phone/browser).", user.email)
-        return
+    data = json.dumps(payload)
+    out = {"delivered": 0, "removed": 0, "errors": []}
 
     for sub in subs:
+        label = _device_label(sub.endpoint)
         try:
             webpush(
                 subscription_info={
                     "endpoint": sub.endpoint,
                     "keys": {"p256dh": sub.p256dh, "auth": sub.auth},
                 },
-                data=json.dumps(payload),
+                data=data,
                 vapid_private_key=settings.VAPID_PRIVATE_KEY,
                 vapid_claims=dict(settings.VAPID_CLAIMS),  # webpush mutates this dict — always pass a fresh copy
                 ttl=ttl,
                 # "high" makes Android deliver straight away even in battery
                 # saving (Doze) instead of batching the push for later.
                 headers={"Urgency": "high"},
-                timeout=10,  # never let a slow push service hang the request that triggered it
+                timeout=10,  # never let a slow push service hang for long
             )
+            out["delivered"] += 1
         except WebPushException as exc:
             response = getattr(exc, "response", None)
             status_code = getattr(response, "status_code", None)
             if status_code in (404, 410):
-                sub.delete()
-                logger.info("Web push: removed expired subscription of %s (%s).", user.email, status_code)
+                try:
+                    cache.set(dead_endpoint_key(sub.endpoint), 1, DEAD_ENDPOINT_TTL)
+                except Exception:  # noqa: BLE001 - cache trouble must not stop the cleanup
+                    logger.exception("Could not remember dead push endpoint")
+                try:
+                    sub.delete()
+                except Exception:  # noqa: BLE001
+                    logger.exception("Could not delete expired push subscription %s", sub.pk)
+                out["removed"] += 1
+                logger.info("Web push: removed expired subscription of %s (%s).", email, status_code)
             else:
                 body = ""
                 try:
                     body = (response.text or "")[:300] if response is not None else ""
                 except Exception:  # noqa: BLE001
                     pass
-                logger.error("Web push failed for %s: status=%s error=%s body=%s", user.email, status_code, exc, body)
-        except Exception:  # noqa: BLE001 - bad key format, network error, ...
-            logger.exception("Web push crashed for %s", user.email)
+                out["errors"].append({"device": label, "status": status_code, "detail": body or str(exc)[:200]})
+                logger.error("Web push failed for %s: status=%s error=%s body=%s", email, status_code, exc, body)
+        except Exception as exc:  # noqa: BLE001 - bad key format, network error, ...
+            out["errors"].append({"device": label, "status": None, "detail": f"{type(exc).__name__}: {str(exc)[:200]}"})
+            logger.exception("Web push crashed for %s", email)
+    return out
+
+
+def _deliver_in_background(subs, payload: dict, email: str) -> None:
+    try:
+        _deliver(subs, payload, email)
+    except Exception:  # noqa: BLE001
+        logger.exception("Background web push crashed for %s", email)
+    finally:
+        close_old_connections()  # this worker thread owns its own DB connection
+
+
+def send_web_push(user, payload: dict, wait: bool = False) -> dict:
+    """Pushes `payload` (JSON-serializable) to every device/browser `user`
+    has subscribed on. Silently drops subscriptions the browser has since
+    revoked (410 Gone / 404 Not Found) by deleting them, so dead endpoints
+    don't pile up. Never raises — a push failure should never break the
+    call/message flow that triggered it (the websocket/REST path still works).
+
+    By default the network part runs on a background thread and this returns
+    immediately (`queued: True`). `wait=True` (used by the test endpoint)
+    sends right now and returns the per-device outcome.
+
+    Every failure is written to the server log with the push service's own
+    answer, so "why didn't the notification arrive" can be read straight from
+    the Railway logs.
+
+    Returns {configured, reason, subscriptions, delivered, removed, errors[, queued]}."""
+    result = {"configured": True, "reason": "", "subscriptions": 0, "delivered": 0, "removed": 0, "errors": []}
+    payload = _for_recipient(user, payload)
+
+    problem = _config_problem()
+    if problem:
+        logger.error("Web push NOT sent: %s", problem)
+        result.update(configured=False, reason=problem)
+        return result
+
+    subs = list(PushSubscription.objects.filter(user=user))
+    result["subscriptions"] = len(subs)
+    if not subs:
+        logger.info("Web push skipped for %s: no subscribed device (Enable was never accepted on a phone/browser).", user.email)
+        return result
+
+    if wait or getattr(settings, "WEBPUSH_SYNC", False):
+        result.update(_deliver(subs, payload, user.email))
+        return result
+
+    _executor.submit(_deliver_in_background, subs, payload, user.email)
+    result["queued"] = True
+    return result
 
 
 def send_incoming_call_push(callee, call_data, caller_name):
@@ -167,29 +304,85 @@ def notify_user(user, payload: dict):
         logger.exception("Web push notify failed for user %s", user.id)
 
 
+def notify_client_portal(client, payload: dict):
+    """Notify a Client (dashboard.Client) on their portal login, if they have
+    one and it is active. Same two delivery paths as notify_user, so the
+    client gets the OS-level banner even when the portal is closed."""
+    portal = getattr(client, "portal_user", None)
+    if portal is None or not portal.is_active:
+        return
+    notify_user(portal, payload)
+
+
+def notify_client_thread_reply(message, staff_user):
+    """Staff replied in the client's Messages thread (dashboard.ClientMessage)."""
+    text = (getattr(message, "text", "") or "").strip()
+    if not text:
+        text = "Sent you an attachment" if getattr(message, "attachment", None) else "New message"
+    who = (getattr(staff_user, "name", "") or "").strip() or "Your Hopenix team"
+    notify_client_portal(message.client, {
+        "type": "client.message",
+        "title": f"New message from {who}",
+        "body": text if len(text) <= 140 else text[:137] + "...",
+        "tag": f"client-thread-{message.client_id}",
+    })
+
+
+def notify_module_file_approved(module_file):
+    """A file was approved onto the Client Portal (projects ModuleViewSet.approve)
+    — tell that project's client there is something new to look at."""
+    module = module_file.module
+    project = module.project
+    if not project.client_id:
+        return
+    notify_client_portal(project.client, {
+        "type": "project.update",
+        "title": f"Update on {project.name}",
+        "body": f'New file for "{module.name}" is ready for you to view.',
+        "tag": f"project-update-{project.id}",
+    })
+
+
 def notify_tasks_assigned(assignments, assigner):
     """`assignments` = iterable of (task, [display names newly added to it]).
 
     Task.assignees stores display NAMES (not user ids), so people are
     matched by User.name — the same matching the ?assignee= filter and the
-    Tasks page already use. One notification per person even when several
-    tasks were assigned in one go (bulk role-template create), and never
-    to the person who made the assignment."""
+    Tasks page already use — but case-insensitively and ignoring stray
+    spaces, so "ali khan" still finds "Ali Khan". One notification per
+    person even when several tasks were assigned in one go (bulk
+    role-template create), and never to the person who made the assignment."""
     from django.contrib.auth import get_user_model
+    from django.db.models.functions import Lower, Trim
 
-    per_name = {}
+    def norm(name):
+        return " ".join(str(name or "").split()).lower()
+
+    per_key = {}
     for task, names in assignments:
         for name in names:
-            per_name.setdefault(name, []).append(task)
-    if not per_name:
+            key = norm(name)
+            if key and task not in per_key.setdefault(key, []):
+                per_key[key].append(task)
+    if not per_key:
         return
 
     assigner_id = getattr(assigner, "id", None)
     assigner_name = getattr(assigner, "name", "") or "Someone"
-    for user in get_user_model().objects.filter(name__in=list(per_name), is_active=True):
-        if user.id == assigner_id:
+    candidates = (
+        get_user_model()
+        .objects.filter(is_active=True)
+        .annotate(_norm_name=Lower(Trim("name")))
+        .filter(_norm_name__in=list(per_key))
+    )
+    notified = set()
+    for user in candidates:
+        if user.id == assigner_id or user.id in notified:
             continue
-        tasks = per_name[user.name]
+        notified.add(user.id)
+        tasks = per_key.get(norm(user.name)) or []
+        if not tasks:
+            continue
         single = len(tasks) == 1
         notify_user(user, {
             "type": "task.assigned",

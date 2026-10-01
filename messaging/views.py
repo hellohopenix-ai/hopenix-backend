@@ -1,5 +1,9 @@
+import logging
+import threading
+
 from django.contrib.auth import get_user_model
-from django.db import models
+from django.core.cache import cache
+from django.db import close_old_connections, models
 from django.utils import timezone
 from rest_framework import permissions, status
 from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
@@ -12,10 +16,18 @@ from channels.layers import get_channel_layer
 from .consumers import is_user_online, user_group_name
 from .models import Call, Conversation, Message, MessageReaction, Participant, PushSubscription
 from .permissions import can_message, get_allowed_contact_ids, get_allowed_contacts
-from .push_utils import send_incoming_call_push, send_missed_call_push, send_new_message_push
+from .push_utils import (
+    dead_endpoint_key,
+    describe_push_setup,
+    send_incoming_call_push,
+    send_missed_call_push,
+    send_new_message_push,
+    send_web_push,
+)
 from .serializers import CallSerializer, ContactSerializer, ConversationListSerializer, MessageSerializer
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
 
 
 def push_to_user(user_id, payload):
@@ -569,6 +581,9 @@ class PushSubscribeView(APIView):
     duplicate rows for the same browser."""
 
     permission_classes = [permissions.IsAuthenticated]
+    # The blanket 5000/hour per-user limit is shared with all the polling the
+    # app does; a 429 here would silently leave the device unsubscribed.
+    throttle_classes = []
 
     def post(self, request):
         endpoint = request.data.get("endpoint")
@@ -579,6 +594,15 @@ class PushSubscribeView(APIView):
             return Response(
                 {"error": "endpoint and keys.p256dh/keys.auth are required."},
                 status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # The push service already told us this registration is dead (404/410).
+        # Saving it again would only bring the problem back, so make the
+        # browser create a fresh one (see pushSubscription.js).
+        if cache.get(dead_endpoint_key(endpoint)):
+            return Response(
+                {"stale": True, "detail": "This device's push registration expired. Creating a new one."},
+                status=status.HTTP_409_CONFLICT,
             )
 
         PushSubscription.objects.update_or_create(
@@ -592,9 +616,70 @@ class PushUnsubscribeView(APIView):
     """POST /api/messages/push/unsubscribe/   Body: { endpoint }"""
 
     permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = []
 
     def post(self, request):
         endpoint = request.data.get("endpoint")
         if endpoint:
             PushSubscription.objects.filter(endpoint=endpoint, user=request.user).delete()
         return Response({"success": True})
+
+
+class PushTestView(APIView):
+    """Lets a person check, from inside the app, that notifications really
+    reach THIS account's devices.
+
+    GET  /api/messages/push/test/
+         -> server-side state: is VAPID configured, how many devices are
+            subscribed (and what kind), no push is sent.
+    POST /api/messages/push/test/      Body: { "delay": 0..60 }  (seconds)
+         delay = 0  -> sends a test notification to all of the caller's
+                       devices right now and returns what the push service
+                       answered per device (delivered / error + reason).
+         delay > 0  -> same, but sent after `delay` seconds, so the person
+                       can close the app / lock the phone first and see
+                       whether it arrives while Hopenix is NOT open.
+    Only ever notifies the caller themself."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = []
+
+    TEST_PAYLOAD = {
+        "type": "test",
+        "title": "Hopenix test notification",
+        "body": "Notifications are working on this device \U0001F389",
+    }
+
+    def get(self, request):
+        return Response(describe_push_setup(request.user))
+
+    def post(self, request):
+        try:
+            delay = int(request.data.get("delay") or 0)
+        except (TypeError, ValueError):
+            delay = 0
+        delay = max(0, min(delay, 60))
+
+        if delay == 0:
+            return Response(send_web_push(request.user, dict(self.TEST_PAYLOAD), wait=True))
+
+        info = describe_push_setup(request.user)
+        if info["configured"] and info["subscriptions"]:
+            user_id = request.user.id
+
+            def _send_later():
+                try:
+                    user = User.objects.filter(id=user_id).first()
+                    if user:
+                        send_web_push(user, dict(PushTestView.TEST_PAYLOAD), wait=True)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Delayed push test failed for user %s", user_id)
+                finally:
+                    close_old_connections()
+
+            timer = threading.Timer(delay, _send_later)
+            timer.daemon = True
+            timer.start()
+            info["scheduled"] = True
+            info["inSeconds"] = delay
+        return Response(info)

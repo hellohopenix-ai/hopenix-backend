@@ -1397,7 +1397,14 @@ class ClientMessageViewSet(viewsets.ModelViewSet):
                 raise PermissionDenied("Portal access isn't linked to a client account.")
             serializer.save(client=client_profile, sender="client")
         else:
-            serializer.save(sender="admin", created_by=user)
+            message = serializer.save(sender="admin", created_by=user)
+            # Phone/laptop banner for the client on their portal login (also when the portal is closed).
+            try:
+                from messaging.push_utils import notify_client_thread_reply
+
+                notify_client_thread_reply(message, user)
+            except Exception:  # noqa: BLE001 - a failed push must never break saving the message
+                pass
 
 
 class SupportRequestView(APIView):
