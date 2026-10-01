@@ -22,3 +22,10 @@ class SettingsConfig(AppConfig):
 
     default_auto_field = "django.db.models.BigAutoField"
     name = "settings"
+
+    def ready(self):
+        # Wire the Notifications-tab events (task completed, invoice paid,
+        # project update) — see settings/signals.py.
+        from . import signals
+
+        signals.register()

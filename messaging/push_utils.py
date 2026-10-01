@@ -271,37 +271,62 @@ def send_new_message_push(recipient, message_data, sender_name):
         text = (message_data.get("text") or "").strip()
         body = (text[:120] + "…") if len(text) > 120 else (text or "Sent a message")
 
-    send_web_push(recipient, {
+    payload = {
         "type": "message.new",
         "senderId": message_data.get("senderId"),
         "conversationId": message_data.get("conversation_id"),
         "title": sender_name,
         "body": body,
-    })
+    }
+    # Settings -> Notifications -> "New Message": honour this user's own
+    # Push / Email toggles (previously they were saved but never read).
+    from settings.notify import send_event_email, wants
+
+    if wants(recipient, "new_message", "push"):
+        send_web_push(recipient, payload)
+    if wants(recipient, "new_message", "email"):
+        # At most one email per sender per 15 min, so a chatty conversation
+        # doesn't flood an inbox while the recipient is offline.
+        key = f"msg-email:{recipient.id}:{payload['senderId']}"
+        if cache.add(key, 1, 15 * 60):
+            send_event_email(recipient, "new_message", f"New message from {sender_name}", f"{sender_name}: {body}")
 
 
-def notify_user(user, payload: dict):
-    """One call = both delivery paths for a single notification:
-
-    1. websocket (push_to_user) — instant, lights the sidebar red dot if
-       the app is open in any tab/device of that user;
-    2. Web Push (send_web_push) — the OS-level "WhatsApp-style" banner on
-       phone/laptop, also when the site is closed. The service worker
-       (public/sw.js) skips showing it when the app is already open and
-       focused, so nobody gets a banner for something they are looking at.
-
-    Never raises — a failed notification must never break the request
-    (task save, module edit, ...) that triggered it."""
+def push_in_app(user, payload: dict) -> bool:
+    """Instant in-app path (websocket -> sidebar red dot). Never raises."""
     from .views import push_to_user  # lazy: views.py imports this module
 
     try:
         push_to_user(user.id, payload)
+        return True
     except Exception:  # noqa: BLE001
-        logger.exception("Websocket notify failed for user %s", user.id)
+        logger.exception("Websocket notify failed for user %s", getattr(user, "id", None))
+        return False
+
+
+def notify_user(user, payload: dict, event_key=None, email_subject=None, email_body=None):
+    """One call = every delivery path for a single notification:
+
+    1. websocket (push_in_app) — instant, lights the sidebar red dot if
+       the app is open in any tab/device of that user;
+    2. Web Push (send_web_push) — the OS-level "WhatsApp-style" banner on
+       phone/laptop, also when the site is closed. The service worker
+       (public/sw.js) skips showing it when the app is already open and
+       focused, so nobody gets a banner for something they are looking at;
+    3. email — if the user turned Email on for this event.
+
+    Channels 2 and 3 obey the user's Settings -> Notifications toggles
+    (see settings/notify.py). Events that are not one of the six toggles
+    (calls, birthdays, client-portal updates...) are always delivered as before.
+    Never raises — a failed notification must never break the request
+    (task save, module edit, ...) that triggered it."""
+    from settings.notify import deliver
+
     try:
-        send_web_push(user, payload)
+        return deliver(user, payload, event_key, email_subject=email_subject, email_body=email_body)
     except Exception:  # noqa: BLE001
-        logger.exception("Web push notify failed for user %s", user.id)
+        logger.exception("Notify failed for user %s", getattr(user, "id", None))
+        return {"inapp": False, "push": False, "email": False}
 
 
 def notify_client_portal(client, payload: dict):
@@ -384,16 +409,17 @@ def notify_tasks_assigned(assignments, assigner):
         if not tasks:
             continue
         single = len(tasks) == 1
+        body = (
+            f'{assigner_name} assigned you "{tasks[0].title}"'
+            if single
+            else f"{assigner_name} assigned you {len(tasks)} tasks"
+        )
         notify_user(user, {
             "type": "task.assigned",
             "taskId": tasks[0].id if single else None,
             "title": "New task assigned",
-            "body": (
-                f'{assigner_name} assigned you "{tasks[0].title}"'
-                if single
-                else f"{assigner_name} assigned you {len(tasks)} tasks"
-            ),
-        })
+            "body": body,
+        }, email_subject="New task assigned", email_body=body)
 
 
 def notify_module_assigned(module, assigner):
@@ -404,12 +430,13 @@ def notify_module_assigned(module, assigner):
         return
     assigner_name = getattr(assigner, "name", "") or "Someone"
     project_name = getattr(module.project, "name", "") or "a project"
+    body = f'{assigner_name} assigned you "{module.name}" in {project_name}'
     notify_user(assignee, {
         "type": "task.assigned",
         "taskId": None,
         "title": "New task assigned",
-        "body": f'{assigner_name} assigned you "{module.name}" in {project_name}',
-    })
+        "body": body,
+    }, email_subject="New task assigned", email_body=body)
 
 
 def notify_project_assigned(project, users, assigner):
@@ -423,9 +450,10 @@ def notify_project_assigned(project, users, assigner):
         if user is None or user.id == assigner_id or user.id in seen or not user.is_active:
             continue
         seen.add(user.id)
+        body = f'{assigner_name} added you to "{project.name}"'
         notify_user(user, {
             "type": "project.assigned",
             "projectId": project.id,
             "title": "Added to a project",
-            "body": f'{assigner_name} added you to "{project.name}"',
-        })
+            "body": body,
+        }, email_subject="Added to a project", email_body=body)

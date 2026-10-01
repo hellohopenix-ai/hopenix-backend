@@ -1,5 +1,17 @@
+import os
+import uuid
+
 from django.conf import settings as django_settings
 from django.db import models
+from django.db.models.functions import Lower
+
+
+def company_logo_path(instance, filename):
+    """media/company/logo/<random>.<ext> — a fresh random name on every
+    upload, so a replaced logo gets a brand-new URL and no browser/CDN
+    ever keeps showing the old picture from cache."""
+    ext = os.path.splitext(filename or "")[1].lower()
+    return f"company/logo/{uuid.uuid4().hex}{ext}"
 
 
 class CompanySettings(models.Model):
@@ -24,6 +36,12 @@ class CompanySettings(models.Model):
     time_format = models.CharField(max_length=10, blank=True, default="12h")
     language = models.CharField(max_length=10, blank=True, default="en")
     default_dashboard = models.CharField(max_length=50, blank=True, default="overview")
+
+    # Company logo (Settings -> General -> Company Logo). Empty = the site
+    # falls back to its built-in Hopenix phoenix. Served to every page —
+    # including the logged-out login/landing pages — via the public
+    # GET /api/settings/branding/ endpoint.
+    logo = models.FileField(upload_to=company_logo_path, null=True, blank=True)
 
     compact_mode = models.BooleanField(default=False)
     email_notifications = models.BooleanField(default=True)
@@ -98,6 +116,10 @@ class BillingInfo(models.Model):
     storage_used_gb = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     storage_limit_gb = models.DecimalField(max_digits=10, decimal_places=2, default=5)
 
+    # When the current plan renews (set when a plan is chosen; shown in the
+    # Subscription card instead of the old hard-coded date).
+    next_billing_date = models.DateField(null=True, blank=True)
+
     updated_at = models.DateTimeField(auto_now=True)
 
     @classmethod
@@ -107,6 +129,31 @@ class BillingInfo(models.Model):
 
     def __str__(self):
         return f"Billing · {self.plan_name}"
+
+
+class BillingEvent(models.Model):
+    """One row of the Billing History table: a plan change or a payment-method
+    update, written by the server at the moment it happens (nothing here is
+    typed in by the browser). There is no payment gateway in this project, so
+    `status` is "Recorded" — the change was saved — never "Paid"."""
+
+    KIND_PLAN = "plan"
+    KIND_CARD = "card"
+
+    kind = models.CharField(max_length=10, default=KIND_PLAN)
+    description = models.CharField(max_length=255)
+    amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    status = models.CharField(max_length=20, default="Recorded")
+    created_by = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return f"{self.created_at:%Y-%m-%d} {self.description}"
 
 
 class ProjectSettings(models.Model):
@@ -220,3 +267,35 @@ class SalesSettings(models.Model):
 
     def __str__(self):
         return "Sales Settings"
+
+
+class Department(models.Model):
+    """A real department. `users.User.department` is (and stays) a plain
+    text field, so a department really "exists" as soon as at least one
+    person has it. This table only adds the extra info a text field can't
+    hold (head, monthly budget) and lets an admin create a department
+    before anyone is in it. The Departments tab keeps the two in sync:
+    every department name found on a User gets a row here automatically
+    (see views._sync_departments), and renaming one here renames it on
+    every user that has it."""
+
+    name = models.CharField(max_length=255)
+    head = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="headed_departments",
+    )
+    budget = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(Lower("name"), name="uniq_department_name_ci"),
+        ]
+
+    def __str__(self):
+        return self.name

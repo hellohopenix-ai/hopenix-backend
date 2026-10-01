@@ -13,7 +13,24 @@ from .models import (
 )
 
 
+def absolute_logo_url(obj, request=None):
+    """Public URL of the company logo, or "" when none is set (the site then
+    shows its built-in phoenix)."""
+    if not obj.logo:
+        return ""
+    try:
+        url = obj.logo.url
+    except Exception:  # noqa: BLE001 — storage misconfigured / file gone
+        return ""
+    return request.build_absolute_uri(url) if request else url
+
+
 class CompanySettingsSerializer(serializers.ModelSerializer):
+    logo = serializers.SerializerMethodField()
+
+    def get_logo(self, obj):
+        return absolute_logo_url(obj, self.context.get("request"))
+
     class Meta:
         model = CompanySettings
         fields = [
@@ -22,9 +39,9 @@ class CompanySettingsSerializer(serializers.ModelSerializer):
             "timezone", "currency", "date_format", "time_format",
             "language", "default_dashboard",
             "compact_mode", "email_notifications", "auto_currency_update",
-            "updated_at",
+            "logo", "updated_at",
         ]
-        read_only_fields = ["updated_at"]
+        read_only_fields = ["updated_at", "logo"]
 
 
 class NotificationPreferenceSerializer(serializers.ModelSerializer):
@@ -47,15 +64,51 @@ class SecuritySettingSerializer(serializers.ModelSerializer):
 
 
 class BillingInfoSerializer(serializers.ModelSerializer):
+    """What the Billing tab / Subscription card / storage bar read. The plan
+    catalog and the history ride along so the browser holds no plan data of its
+    own. `plan_name`, `price`, `storage_limit_gb` and `next_billing_date` are
+    server-controlled: BillingInfoView derives them from the chosen plan."""
+
+    history = serializers.SerializerMethodField()
+    plans = serializers.SerializerMethodField()
+    features = serializers.SerializerMethodField()
+
+    def get_history(self, obj):
+        from .models import BillingEvent
+
+        return [
+            {
+                "id": e.id,
+                "kind": e.kind,
+                "date": e.created_at.date().isoformat(),
+                "description": e.description,
+                "amount": float(e.amount),
+                "status": e.status,
+            }
+            for e in BillingEvent.objects.all()[:50]
+        ]
+
+    def get_plans(self, obj):
+        from .plans import PLAN_CATALOG
+
+        return PLAN_CATALOG
+
+    def get_features(self, obj):
+        from .plans import get_plan
+
+        plan = get_plan(obj.plan_name)
+        return plan["features"] if plan else []
+
     class Meta:
         model = BillingInfo
         fields = [
             "plan_name", "price", "billing_cycle",
             "card_brand", "card_last4", "card_expiry",
             "storage_used_gb", "storage_limit_gb",
+            "next_billing_date", "features", "plans", "history",
             "updated_at",
         ]
-        read_only_fields = ["updated_at"]
+        read_only_fields = fields
 
 
 class ProjectSettingsSerializer(serializers.ModelSerializer):
