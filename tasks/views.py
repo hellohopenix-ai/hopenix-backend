@@ -140,6 +140,55 @@ def _clear_project_zip_if_matches(task, zip_file):
         pass
 
 
+def _resolve_task_module(task, hint_module_id=None):
+    """The projects.Module this task belongs to: its own FK, else (older
+    tasks saved before the FK was stamped) the module id the frontend
+    knows — trusted only when that module is in the SAME client's project."""
+    if task.module_id:
+        return task.module
+    if str(hint_module_id or "").isdigit() and task.client_id:
+        candidate = Module.objects.select_related("project").filter(pk=int(hint_module_id)).first()
+        if candidate and candidate.project.client_id == task.client_id:
+            return candidate
+    return None
+
+
+def _push_link_to_module(task, url, hint_module_id=None):
+    """Task Page link -> the real Module.url, so the Projects page and the
+    Clients page (and Portal, once approved) show it.
+
+    Done SERVER-SIDE on purpose: the old browser-side PATCH to
+    /api/projects/<id>/modules/<id>/ is refused (403) for an assignee who is
+    not in the project's team/manager/creator, and was skipped entirely for
+    tasks without a client — so the link silently never arrived. Same
+    review rule as ModuleViewSet.perform_update: a CHANGED link goes back to
+    "pending review"."""
+    url = (url or "").strip()
+    if not url or len(url) > 200 or not url.lower().startswith(("http://", "https://")):
+        return None
+    module = _resolve_task_module(task, hint_module_id)
+    if module is None:
+        return None
+    if not task.module_id:
+        task.module = module
+        task.save(update_fields=["module", "updated_at"])  # repair the missing FK
+    old_url = module.url or ""
+    if old_url.strip().rstrip("/") == url.rstrip("/"):
+        return module
+    module.url = url
+    module.url_approved = False
+    module.url_approved_by = None
+    module.url_approved_at = None
+    module.save(update_fields=["url", "url_approved", "url_approved_by", "url_approved_at", "updated_at"])
+    try:
+        from projects.views import mirror_module_url_to_tasks
+
+        mirror_module_url_to_tasks(module, old_url)  # keep the module's OTHER tasks in step
+    except Exception:  # noqa: BLE001
+        logger.exception("Module link -> task mirror failed")
+    return module
+
+
 class TaskViewSet(viewsets.ModelViewSet):
     """Full CRUD for TasksPage.jsx (list/create/retrieve/update/delete),
     plus the handful of actions the page needs beyond plain field edits —
@@ -286,6 +335,13 @@ class TaskViewSet(viewsets.ModelViewSet):
         task.save()
         self._sync_linked_module_status(task)
 
+        hint_module_id = request.data.get("moduleId")
+        if link:
+            _push_link_to_module(task, link, hint_module_id)
+        for att in new_attachments:
+            if isinstance(att, dict) and att.get("type") == "link" and att.get("url"):
+                _push_link_to_module(task, att["url"], hint_module_id)
+
         return Response(TaskSerializer(task).data)
 
     @action(detail=True, methods=["post"], url_path="add-attachment")
@@ -300,6 +356,9 @@ class TaskViewSet(viewsets.ModelViewSet):
         body.is_valid(raise_exception=True)
         task.attachments = [*(task.attachments or []), body.validated_data["attachment"]]
         task.save(update_fields=["attachments", "updated_at"])
+        att = body.validated_data["attachment"]
+        if isinstance(att, dict) and att.get("type") == "link" and att.get("url"):
+            _push_link_to_module(task, att["url"], request.data.get("moduleId"))
         return Response(TaskSerializer(task).data)
 
     @action(detail=True, methods=["post"], url_path="remove-attachment")
@@ -496,6 +555,11 @@ class TaskViewSet(viewsets.ModelViewSet):
         file_obj = request.FILES.get("zip")
         if not file_obj:
             return Response({"error": "No zip uploaded."}, status=400)
+        # Older tasks have no Task.module FK — resolve + repair it so the mirror below works.
+        _module = _resolve_task_module(task, request.data.get("moduleId"))
+        if _module is not None and not task.module_id:
+            task.module = _module
+            task.save(update_fields=["module", "updated_at"])
         if not file_obj.name.lower().endswith(".zip"):
             return Response({"error": "Only .zip files are allowed."}, status=400)
 
@@ -527,8 +591,8 @@ class TaskViewSet(viewsets.ModelViewSet):
                     size=file_obj.size,
                     uploaded_by=request.user,
                 )
-            except Exception:
-                pass  # cross-browser mirror is best-effort
+            except Exception:  # noqa: BLE001
+                logger.exception("Task zip -> ModuleFile mirror failed")  # was a silent `pass`
 
         # Final project deliverable (Tasks page sends final=1) -> also the
         # project's own completed_zip, which Clients page / Portal read.
@@ -568,6 +632,11 @@ class TaskViewSet(viewsets.ModelViewSet):
         file_obj = request.FILES.get("file")
         if not file_obj:
             return Response({"error": "No file uploaded."}, status=400)
+
+        _module = _resolve_task_module(task, request.data.get("moduleId"))
+        if _module is not None and not task.module_id:
+            task.module = _module
+            task.save(update_fields=["module", "updated_at"])
 
         if not task.module_id:
             return Response(
