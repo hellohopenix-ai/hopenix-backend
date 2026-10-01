@@ -198,29 +198,26 @@ class SendMessageView(APIView):
         # this, reusing logic that's already correct per-viewer — REST
         # polling in MessagesPage.jsx keeps working underneath too, as
         # a fallback in case a socket is down.
-        push_to_user(recipient.id, {
-            "type": "message.new", "conversation_id": conv.id,
-            "sender_id": request.user.id, "recipient_id": recipient.id,
-            "message": message_data,
-        })
-        push_to_user(request.user.id, {
-            "type": "message.new", "conversation_id": conv.id,
-            "sender_id": request.user.id, "recipient_id": recipient.id,
-            "message": message_data,
-        })
+        # Each delivery path is isolated: if one fails (e.g. the websocket /
+        # Redis layer is down) the others must STILL run, and the sender must
+        # never get a 500 for a message that is already saved. The phone/
+        # laptop banner is sent FIRST because it does not depend on the
+        # websocket at all.
+        try:
+            send_new_message_push(recipient, message_data, request.user.name)
+        except Exception:  # noqa: BLE001
+            logger.exception("Message push to user %s failed", recipient.id)
 
-        # The websocket push above only reaches the recipient if their tab
-        # is actually open right now. Web Push (same mechanism CallStartView
-        # already uses for calls) wakes their device with an OS-level
-        # notification even with nothing running, like WhatsApp does.
-        #
-        # It is sent ALWAYS now, not only when is_user_online() is False:
-        # an open-but-hidden tab (minimised window, other tab in front, phone
-        # locked but socket not dropped yet) counts as "online" and used to
-        # get no banner at all. The service worker (public/sw.js) drops the
-        # push when the app window is visible AND focused, so an active chat
-        # never gets a duplicate banner.
-        send_new_message_push(recipient, message_data, request.user.name)
+        event = {
+            "type": "message.new", "conversation_id": conv.id,
+            "sender_id": request.user.id, "recipient_id": recipient.id,
+            "message": message_data,
+        }
+        for target_id in (recipient.id, request.user.id):
+            try:
+                push_to_user(target_id, event)
+            except Exception:  # noqa: BLE001
+                logger.exception("Websocket message.new to user %s failed", target_id)
 
         return Response(message_data, status=status.HTTP_201_CREATED)
 
