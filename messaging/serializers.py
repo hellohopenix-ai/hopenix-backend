@@ -146,10 +146,18 @@ class ConversationListSerializer(serializers.ModelSerializer):
     lastMessage = serializers.SerializerMethodField()
     unreadCount = serializers.SerializerMethodField()
     updatedAt = serializers.DateTimeField(source="updated_at", read_only=True)
+    hidden = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
-        fields = ["id", "isGroup", "name", "avatar", "otherUser", "members", "lastMessage", "unreadCount", "updatedAt"]
+        fields = ["id", "isGroup", "name", "avatar", "otherUser", "members", "lastMessage", "unreadCount", "updatedAt", "hidden"]
+
+    def _membership(self, obj):
+        return obj.memberships.filter(user=self._viewer()).first()
+
+    def get_hidden(self, obj):
+        m = self._membership(obj)
+        return bool(m and m.hidden)
 
     def _viewer(self):
         return self.context["request"].user
@@ -181,7 +189,11 @@ class ConversationListSerializer(serializers.ModelSerializer):
         return list(obj.participants.values_list("name", flat=True))
 
     def get_lastMessage(self, obj):
-        last = obj.messages.order_by("-created_at").first()
+        qs = obj.messages.order_by("-created_at")
+        m = self._membership(obj)
+        if m and m.cleared_at:
+            qs = qs.filter(created_at__gt=m.cleared_at)
+        last = qs.first()
         if not last:
             return None
         return {

@@ -45,6 +45,15 @@ def push_to_user(user_id, payload):
     )
 
 
+def _cleared_at_for(conv, user):
+    """When `user` last deleted this chat 'for me' (None if never)."""
+    return (
+        Participant.objects.filter(conversation=conv, user=user)
+        .values_list("cleared_at", flat=True)
+        .first()
+    )
+
+
 def get_or_create_direct_conversation(user1, user2):
     """Finds or creates a direct 1-to-1 conversation between user1 and user2."""
     conv = (
@@ -77,8 +86,11 @@ class ConversationsListView(APIView):
         for other in get_allowed_contacts(user):
             get_or_create_direct_conversation(user, other)
 
+        # Chats the user deleted "for me" are still returned (flagged
+        # `hidden`) so the Messages search can find that person again; the
+        # frontend keeps them out of the normal inbox list.
         convs = (
-            Conversation.objects.filter(memberships__user=user, memberships__hidden=False)
+            Conversation.objects.filter(memberships__user=user)
             .distinct()
             .order_by("-updated_at")
         )
@@ -114,6 +126,9 @@ class ThreadMessagesView(APIView):
 
         conv = get_or_create_direct_conversation(request.user, target_user)
         messages = conv.messages.filter(is_deleted=False).order_by("created_at")
+        cleared_at = _cleared_at_for(conv, request.user)
+        if cleared_at:
+            messages = messages.filter(created_at__gt=cleared_at)
         return Response(MessageSerializer(messages, many=True, context={"request": request}).data)
 
 
@@ -331,11 +346,12 @@ class MessageDeleteView(APIView):
 
 class ConversationDeleteView(APIView):
     """DELETE /api/messages/conversations/<id>/
-    Permanently deletes a whole chat: every message in it (rows, attachment
-    files, reactions) and its finished call history are removed from the
-    database for everyone. The empty conversation is then hidden from the
-    inbox of both people; it only comes back (empty) if somebody sends a new
-    message, exactly like before."""
+    WhatsApp-style "delete chat for me": the chat is cleared and hidden ONLY
+    for the person who deleted it. Nothing is removed from the database, so
+    the other person still sees the full conversation (messages, files,
+    calls). The deleter can still find that person via search, and if either
+    side sends a new message the chat comes back for the deleter showing only
+    the NEW messages."""
 
     permission_classes = [permissions.IsAuthenticated]
 
@@ -346,37 +362,25 @@ class ConversationDeleteView(APIView):
         except Conversation.DoesNotExist:
             return Response({"error": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        if not conv.memberships.filter(user=request.user).exists():
+        membership = conv.memberships.filter(user=request.user).first()
+        if not membership:
             return Response(
                 {"error": "You are not part of this conversation."}, status=status.HTTP_403_FORBIDDEN
             )
 
-        participant_ids = list(conv.memberships.values_list("user_id", flat=True))
+        membership.hidden = True
+        membership.unread_count = 0
+        membership.cleared_at = timezone.now()
+        membership.save(update_fields=["hidden", "unread_count", "cleared_at"])
+        # Anything still unread by me in this chat no longer needs a badge.
+        Message.objects.filter(conversation=conv, recipient=request.user, is_read=False).update(is_read=True)
 
-        msgs = list(Message.objects.filter(conversation=conv).only("id", "attachment"))
-        _purge_message_files(msgs)
-        Message.objects.filter(conversation=conv).delete()
-
-        # Finished calls between the two people belong to this chat's
-        # history too (the thread shows them inline). A call that is
-        # ringing/ongoing right now is left alone.
-        finished = Call.objects.exclude(status__in=[Call.RINGING, Call.ONGOING])
-        if conv.type == Conversation.DIRECT and len(participant_ids) == 2:
-            a, b = participant_ids
-            finished.filter(
-                models.Q(caller_id=a, callee_id=b) | models.Q(caller_id=b, callee_id=a)
-            ).delete()
-        else:
-            finished.filter(conversation=conv).delete()
-
-        Participant.objects.filter(conversation=conv).update(hidden=True, unread_count=0)
-
-        event = {"type": "conversation.deleted", "conversation_id": conv.id}
-        for target_id in participant_ids:
-            try:
-                push_to_user(target_id, event)
-            except Exception:  # noqa: BLE001
-                logger.exception("Websocket conversation.deleted to user %s failed", target_id)
+        # Only the deleter's own tabs/devices are told — the other person's
+        # screen must not change.
+        try:
+            push_to_user(request.user.id, {"type": "conversation.deleted", "conversation_id": conv.id})
+        except Exception:  # noqa: BLE001
+            logger.exception("Websocket conversation.deleted to user %s failed", request.user.id)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -419,10 +423,22 @@ class ContactsView(APIView):
 def _callee_sim_number(user):
     """The cell number the person typed when they registered / completed their
     profile (users.Profile.phone). Empty string if they never filled one."""
+    # Employees / managers / admins: the phone from their registration profile.
     try:
-        return (user.profile.phone or "").strip()
+        phone = (user.profile.phone or "").strip()
+        if phone:
+            return phone
     except Exception:  # noqa: BLE001 - no Profile row yet
-        return ""
+        pass
+    # Clients (portal logins): the phone saved on their Client record.
+    try:
+        client = getattr(user, "client_profile", None)
+        phone = ((client.phone if client else "") or "").strip()
+        if phone:
+            return phone
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
 
 
 def send_offline_call_notice(call, request):
@@ -435,13 +451,15 @@ def send_offline_call_notice(call, request):
     number (or "") so the API response can show it as a toast as well."""
     callee = call.callee
     phone = _callee_sim_number(callee)
-    if not phone:
-        return ""
     guard_key = f"offline-call-notice-{call.id}"
     if not cache.add(guard_key, True, timeout=300):
         return phone  # already sent for this call
     try:
-        text = f"{callee.name or 'This user'} is not available on website app, so call on SIM number: {phone}"
+        who = callee.name or "This user"
+        if phone:
+            text = f"{who} is not available on website app, so call on SIM number: {phone}"
+        else:
+            text = f"{who} is not available on website app right now. Please try again later or contact them by phone."
         conv = call.conversation
         # Shown in the caller's chat as an unread message from that person.
         msg = Message.objects.create(
@@ -722,8 +740,15 @@ class CallHistoryView(APIView):
 
         calls = Call.objects.filter(
             models.Q(caller=request.user, callee=other) | models.Q(caller=other, callee=request.user)
-        ).order_by("-started_at")[:20]
-        return Response(CallSerializer(calls, many=True, context={"request": request}).data)
+        ).order_by("-started_at")
+        conv = (
+            Conversation.objects.filter(type=Conversation.DIRECT, memberships__user=request.user)
+            .filter(memberships__user=other).first()
+        )
+        cleared_at = _cleared_at_for(conv, request.user) if conv else None
+        if cleared_at:
+            calls = calls.filter(started_at__gt=cleared_at)
+        return Response(CallSerializer(calls[:20], many=True, context={"request": request}).data)
 
 
 class ActiveIncomingCallView(APIView):

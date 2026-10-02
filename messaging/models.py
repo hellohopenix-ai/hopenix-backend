@@ -74,6 +74,10 @@ class Participant(models.Model):
     # matches the frontend's per-viewer delete behaviour. Re-appears
     # automatically the next time either side sends a new message.
     hidden = models.BooleanField(default=False)
+    # WhatsApp-style "delete chat" (only for me): everything sent up to this
+    # moment is cleared from THIS user's view only. The other person keeps
+    # their full history. New messages (created after this) show normally.
+    cleared_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         unique_together = ("conversation", "user")
