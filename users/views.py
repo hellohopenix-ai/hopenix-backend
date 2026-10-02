@@ -277,23 +277,6 @@ class ApprovedUsersView(APIView):
     def get(self, request):
         users = User.objects.filter(status="approved").exclude(role="client").order_by("name")
         data = [{"id": u.id, "name": u.name, "role": u.role} for u in users]
-        # Projects page -> module "Assign to": CLIENTS must be assignable too.
-        # Only added when asked for (?include_clients=1) and never for a
-        # client's own session, so every other caller keeps the same list.
-        # A client with a portal login comes back with that user's id; one
-        # without comes back with id=null + clientId, and the Projects page
-        # calls EnsureClientUserView the moment a module is assigned to it.
-        if request.query_params.get("include_clients") and request.user.role != "client":
-            from dashboard.models import Client
-
-            for c in Client.objects.select_related("portal_user").order_by("name"):
-                pu = c.portal_user
-                if pu is not None:
-                    if pu.status != "approved" or not pu.is_active:
-                        continue  # portal access revoked -> not assignable
-                    data.append({"id": pu.id, "name": pu.name, "role": "client", "clientId": c.id})
-                else:
-                    data.append({"id": None, "name": (c.contact_person or c.name), "role": "client", "clientId": c.id})
         return Response(data)
 
 
@@ -437,42 +420,6 @@ class RemoveUserView(APIView):
         # End any session they currently have open.
         Token.objects.filter(user=target).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
-
-
-class EnsureClientUserView(APIView):
-    """POST /api/auth/clients/<client_id>/ensure-user/
-    Staff (admin/manager) only. Makes sure this Client has a real client User
-    row, so a project module can be assigned to it (Module.assignee is a User).
-    If one already exists it is returned untouched; otherwise one is created
-    with NO usable password, so nobody can log in until an admin generates the
-    portal access on the Clients page (which sets the password and email)."""
-
-    permission_classes = [permissions.IsAuthenticated]
-
-    def post(self, request, client_id):
-        if request.user.role not in ("admin", "manager"):
-            return Response({"error": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
-        from dashboard.models import Client
-
-        try:
-            client = Client.objects.select_related("portal_user").get(id=client_id)
-        except Client.DoesNotExist:
-            return Response({"error": "Client not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        pu = client.portal_user
-        if pu is None:
-            email = (client.email or "").strip().lower() or f"client-{client.id}@no-email.hopenix.invalid"
-            existing = User.objects.filter(email__iexact=email).first()
-            if existing and existing.role != "client":
-                return Response({"error": "An employee account already uses this client's email."}, status=status.HTTP_400_BAD_REQUEST)
-            if existing and getattr(existing, "client_profile", None) not in (None, client):
-                return Response({"error": "That email is linked to another client."}, status=status.HTTP_400_BAD_REQUEST)
-            pu = existing or User.objects.create_user(
-                email=email, password=None, name=(client.contact_person or client.name), role="client", status="approved"
-            )
-            client.portal_user = pu
-            client.save(update_fields=["portal_user"])
-        return Response({"id": pu.id, "name": pu.name, "role": "client", "clientId": client.id})
 
 
 class AdminUpdateProfileView(APIView):

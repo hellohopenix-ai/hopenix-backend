@@ -11,7 +11,6 @@ urlpatterns = [
     path('pending/', views.PendingUsersView.as_view(), name='pending-users'),
     path('users/', views.UsersListView.as_view(), name='users-list'),
     path('approved-users/', views.ApprovedUsersView.as_view(), name='approved-users'),
-    path('clients/<int:client_id>/ensure-user/', views.EnsureClientUserView.as_view(), name='ensure-client-user'),
     path('users/invite/', views.InviteUserView.as_view(), name='invite-user'),
     path('users/<int:user_id>/approve/', views.ApproveUserView.as_view(), name='approve-user'),
     path('users/<int:user_id>/reject/', views.RejectUserView.as_view(), name='reject-user'),
