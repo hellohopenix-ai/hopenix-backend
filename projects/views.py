@@ -3,6 +3,7 @@ import logging
 from django.core.files.base import ContentFile
 from django.shortcuts import get_object_or_404
 from django.http import FileResponse, Http404
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
@@ -66,12 +67,39 @@ def _norm_url(u):
     return str(u or "").strip().rstrip("/")
 
 
+def _tasks_for_module(module):
+    """Every Task that belongs to `module`.
+
+    FIX (tick / file / zip / link never reached the Tasks page): all the
+    Module -> Task mirrors below used Task.objects.filter(module=module), but
+    Task.module is empty for any task whose module was assigned from the
+    Projects page (and for older tasks), so those tasks were silently skipped.
+    Such orphan tasks are matched by project + module name and ADOPTED (their
+    FK is stamped) - but only when that module name is unique inside the
+    project, so a wrong task is never linked."""
+    from tasks.models import Task
+
+    project = module.project
+    orphans = Task.objects.filter(module__isnull=True, module_name=module.name)
+    if project.client_id:
+        orphans = orphans.filter(client_id=project.client_id).filter(
+            Q(module_project_name=project.name) | Q(project=project.name)
+        )
+    else:
+        orphans = orphans.filter(project=project.name)
+    if Module.objects.filter(project=project, name=module.name).count() == 1:
+        orphan_ids = list(orphans.values_list("pk", flat=True))
+        if orphan_ids:
+            Task.objects.filter(pk__in=orphan_ids).update(module=module)
+    return Task.objects.filter(module=module)
+
+
 def mirror_module_file_to_tasks(module_file, request):
     from tasks.models import Task, TaskZipFile
 
     now = timezone.now()
     kind = _file_kind(module_file.original_name, module_file.mime_type)
-    for task in Task.objects.filter(module_id=module_file.module_id):
+    for task in _tasks_for_module(module_file.module):
         entries = list(task.attachments or [])
         if any(
             isinstance(e, dict)
@@ -124,7 +152,7 @@ def unmirror_module_file_from_tasks(module_file):
 
     now = timezone.now()
     is_zip_name = (module_file.original_name or "").lower().endswith(".zip")
-    for task in Task.objects.filter(module_id=module_file.module_id):
+    for task in _tasks_for_module(module_file.module):
         keep, changed = [], False
         for e in task.attachments or []:
             if not isinstance(e, dict):
@@ -162,7 +190,7 @@ def mirror_module_url_to_tasks(module, old_url):
     if _norm_url(new_url) == _norm_url(old_url):
         return
     now = timezone.now()
-    for task in Task.objects.filter(module=module):
+    for task in _tasks_for_module(module):
         entries = [
             e for e in (task.attachments or [])
             if not (
@@ -551,7 +579,7 @@ class ModuleViewSet(viewsets.ModelViewSet):
     def _mirror_module_to_tasks(self, module, old_status, old_assignee_name):
         from tasks.models import Task
 
-        tasks = Task.objects.filter(module=module)
+        tasks = _tasks_for_module(module)
         if not tasks.exists():
             return
 

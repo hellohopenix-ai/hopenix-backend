@@ -284,23 +284,31 @@ class TaskViewSet(viewsets.ModelViewSet):
     # happens through the `complete` action or a plain PATCH/PUT from
     # TasksPage.jsx (see perform_update below), so it doesn't matter
     # which path the frontend actually uses to mark a task done.
-    def _sync_linked_module_status(self, task):
-        if not task.module_id:
+    def _sync_linked_module_status(self, task, hint_module_id=None):
+        # FIX (tick on the Tasks page never reached the Module): this returned
+        # early when Task.module was empty, which is the case for every task
+        # whose module was assigned from the Projects page. The module is now
+        # resolved (and the FK repaired) first, same as upload / link do.
+        module = _resolve_task_module(task, hint_module_id)
+        if module is None:
             return
+        if not task.module_id:
+            Task.objects.filter(pk=task.pk).update(module=module)
+            task.module = module
         if task.status == "Completed":
             new_status = ModuleStatusChoices.COMPLETED
         elif task.progress and task.progress > 0:
             new_status = ModuleStatusChoices.IN_PROGRESS
         else:
             new_status = ModuleStatusChoices.PENDING
-        Module.objects.filter(pk=task.module_id).exclude(status=new_status).update(status=new_status)
+        Module.objects.filter(pk=module.pk).exclude(status=new_status).update(status=new_status)
 
     def perform_update(self, serializer):
         # Snapshot BEFORE save(): serializer.instance is updated in place,
         # so afterwards the old assignee list would be gone.
         before = set(serializer.instance.assignees or [])
         task = serializer.save()
-        self._sync_linked_module_status(task)
+        self._sync_linked_module_status(task, self.request.data.get("moduleBackendId"))
         added = [n for n in (task.assignees or []) if n not in before]
         if added:
             self._notify_new_assignees([(task, added)])
@@ -356,9 +364,8 @@ class TaskViewSet(viewsets.ModelViewSet):
         if new_attachments:
             task.attachments = [*(task.attachments or []), *new_attachments]
         task.save()
-        self._sync_linked_module_status(task)
-
         hint_module_id = request.data.get("moduleId")
+        self._sync_linked_module_status(task, hint_module_id)
         if link:
             _push_link_to_module(task, link, hint_module_id)
         for att in new_attachments:
