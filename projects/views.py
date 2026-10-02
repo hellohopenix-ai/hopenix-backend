@@ -3,6 +3,8 @@ import logging
 from django.core.files.base import ContentFile
 from django.shortcuts import get_object_or_404
 from django.http import FileResponse, Http404
+from datetime import timedelta
+
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import viewsets, permissions, status
@@ -680,6 +682,24 @@ class ModuleFileViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         return ModuleFile.objects.filter(module=self.get_module())
+
+    def create(self, request, *args, **kwargs):
+        # FIX (one attach -> two files): the same upload arriving twice (double
+        # click / a retried request / two tabs) used to create two rows. An
+        # identical file (same module, name, size, uploader) uploaded within the
+        # last 15 seconds is treated as that same upload and returned as is.
+        incoming = request.FILES.get("file")
+        if incoming is not None:
+            twin = ModuleFile.objects.filter(
+                module_id=self.kwargs["module_pk"],
+                original_name=incoming.name,
+                size=incoming.size,
+                uploaded_by=request.user,
+                uploaded_at__gte=timezone.now() - timedelta(seconds=15),
+            ).first()
+            if twin is not None:
+                return Response(self.get_serializer(twin).data, status=status.HTTP_200_OK)
+        return super().create(request, *args, **kwargs)
 
     def perform_create(self, serializer):
         project = self.get_project()
