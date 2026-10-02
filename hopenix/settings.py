@@ -337,7 +337,7 @@ CLOUDINARY_STORAGE = {
 USE_CLOUDINARY = not DEBUG
 STORAGES = {
     "default": (
-        {"BACKEND": "cloudinary_storage.storage.MediaCloudinaryStorage"}
+        {"BACKEND": "hopenix.cloud_storage.SmartCloudinaryStorage"}
         if USE_CLOUDINARY
         else {"BACKEND": "django.core.files.storage.FileSystemStorage"}
     ),
