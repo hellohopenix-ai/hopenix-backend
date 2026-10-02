@@ -174,6 +174,10 @@ class Module(models.Model):
     # re-tick starts the cycle again.
     handoff_requested_at = models.DateTimeField(null=True, blank=True)
     handoff_sent_at = models.DateTimeField(null=True, blank=True)
+    # Which link the admin was last told about / the next member was last
+    # sent, so the same link is never announced or forwarded twice.
+    handoff_url_notified = models.CharField(max_length=500, blank=True, default="")
+    handoff_url_forwarded = models.CharField(max_length=500, blank=True, default="")
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -216,6 +220,12 @@ class ModuleFile(models.Model):
 
     uploaded_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="uploaded_files")
     uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    # Hand-off bookkeeping (projects/handoff.py): the admin has been told
+    # about this file / an admin approved it and it went to the next member.
+    # Each is set exactly once, so a file is never announced or sent twice.
+    admin_notified_at = models.DateTimeField(null=True, blank=True)
+    forwarded_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
         return self.original_name

@@ -550,6 +550,10 @@ class ModuleViewSet(viewsets.ModelViewSet):
             from .handoff import handle_module_status_change
 
             handle_module_status_change(module, old_status, self.request.user, self.request)
+        if (module.url or "").strip() and module.url != old_url:
+            from .handoff import notify_new_link
+
+            notify_new_link(module, module.url, self.request.user, self.request)
         try:
             mirror_module_url_to_tasks(module, old_url)
         except Exception:  # noqa: BLE001
@@ -698,6 +702,10 @@ class ModuleFileViewSet(viewsets.ModelViewSet):
             mirror_module_file_to_tasks(module_file, self.request)
         except Exception:  # noqa: BLE001
             logger.exception("Module file -> task mirror failed")
+        # Tell the admin about this new file - ONCE (see projects/handoff.py).
+        from .handoff import notify_new_file
+
+        notify_new_file(module_file, self.request.user, self.request)
 
     def perform_destroy(self, instance):
         project = self.get_project()

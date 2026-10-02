@@ -114,6 +114,26 @@ class TaskSerializer(serializers.ModelSerializer):
     def get_moduleProjectBackendId(self, obj):
         return obj.module.project_id if obj.module_id else None
 
+    # Hand-off state of the linked module ("" | "pending" | "sent") so the
+    # Tasks page can show the admin an "Approve & send" button.
+    handoffStatus = serializers.SerializerMethodField()
+    handoffNext = serializers.SerializerMethodField()
+
+    def _handoff(self, obj):
+        if not obj.module_id:
+            return "", ""
+        from projects.serializers import ModuleSerializer
+
+        ser = ModuleSerializer()
+        status_ = ser.get_handoff_status(obj.module)
+        return status_, (ser.get_handoff_next_name(obj.module) if status_ == "pending" else "")
+
+    def get_handoffStatus(self, obj):
+        return self._handoff(obj)[0]
+
+    def get_handoffNext(self, obj):
+        return self._handoff(obj)[1]
+
     class Meta:
         model = Task
         fields = [
@@ -128,6 +148,7 @@ class TaskSerializer(serializers.ModelSerializer):
             "roleTemplate", "requiresLink", "fromClientModule",
             "moduleId", "subModuleId", "fromClientAssignment",
             "moduleBackendId", "moduleProjectBackendId",
+            "handoffStatus", "handoffNext",
         ]
 
     def to_representation(self, instance):

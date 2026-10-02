@@ -40,6 +40,24 @@ def _project_teammate_ids(user):
     return ids
 
 
+def _project_manager_ids(user):
+    """Only the MANAGERS of the active projects `user` is on (as team member,
+    creator, or module assignee) - never the other workers in that group.
+    Used for employees, who must see just their manager on the Messages page
+    (a manager still sees their whole group via _project_teammate_ids)."""
+    from projects.models import Project
+
+    ids = set()
+    projects = Project.objects.filter(is_archived=False).filter(
+        Q(team=user) | Q(created_by=user) | Q(modules__assignee=user)
+    ).distinct()
+    for p in projects.select_related("manager"):
+        if p.manager_id:
+            ids.add(p.manager_id)
+    ids.discard(user.id)
+    return ids
+
+
 def _client_manager_ids(user):
     """FIX (add Client -> auto-assigned task's Message never arrives):
     TasksPage.jsx auto-assigns a task to a Client's manager the moment
@@ -188,12 +206,16 @@ def get_allowed_contacts(user):
         allowed_ids.update(task_ids)
         return base.filter(id__in=allowed_ids)
 
-    # Default (employee/client/accountant/etc.): admin(s) + assigned manager
-    # + project teammates + client managers + task coworkers.
+    # Default (employee/accountant/etc.): admin(s) + their assigned manager +
+    # the manager(s) of the projects they are on. NOT the other workers of
+    # a project group - employees never see or message each other; work
+    # moves between them through the admin-approved hand-off instead. A
+    # manager/admin who gave them a task or owns their client stays reachable.
     allowed_ids = set(base.filter(Q(role="admin") | Q(id=user.manager_id)).values_list("id", flat=True))
-    allowed_ids.update(project_ids)
-    allowed_ids.update(client_ids)
-    allowed_ids.update(task_ids)
+    allowed_ids.update(_project_manager_ids(user))
+    leaders = set(base.filter(role__in=["admin", "manager"]).values_list("id", flat=True))
+    allowed_ids.update(client_ids & leaders)
+    allowed_ids.update(task_ids & leaders)
     return base.filter(id__in=allowed_ids)
 
 

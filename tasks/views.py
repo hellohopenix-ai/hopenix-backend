@@ -176,7 +176,7 @@ def _resolve_task_module(task, hint_module_id=None):
     return None
 
 
-def _push_link_to_module(task, url, hint_module_id=None):
+def _push_link_to_module(task, url, hint_module_id=None, request=None):
     """Task Page link -> the real Module.url, so the Projects page and the
     Clients page (and Portal, once approved) show it.
 
@@ -209,6 +209,11 @@ def _push_link_to_module(task, url, hint_module_id=None):
         mirror_module_url_to_tasks(module, old_url)  # keep the module's OTHER tasks in step
     except Exception:  # noqa: BLE001
         logger.exception("Module link -> task mirror failed")
+    if request is not None:
+        # Tell the admin about this new link - ONCE per link (projects/handoff.py).
+        from projects.handoff import notify_new_link
+
+        notify_new_link(module, url, request.user, request)
     return module
 
 
@@ -260,12 +265,7 @@ class TaskViewSet(viewsets.ModelViewSet):
         created_by = serializer.validated_data.get("created_by") or getattr(
             self.request.user, "name", ""
         ) or "Admin"
-        # Settings -> Tasks: required due date / subtasks switch / auto-assign lead.
-        from settings.rules import default_assignees_for, enforce_task_rules
-
-        enforce_task_rules(serializer.validated_data)
-        lead = default_assignees_for(serializer.validated_data)
-        task = serializer.save(created_by=created_by, **({"assignees": lead} if lead else {}))
+        task = serializer.save(created_by=created_by)
         self._notify_new_assignees([(task, list(task.assignees or []))])
 
     def _notify_new_assignees(self, assignments):
@@ -319,9 +319,6 @@ class TaskViewSet(viewsets.ModelViewSet):
         # Snapshot BEFORE save(): serializer.instance is updated in place,
         # so afterwards the old assignee list would be gone.
         before = set(serializer.instance.assignees or [])
-        from settings.rules import enforce_task_rules
-
-        enforce_task_rules(serializer.validated_data, instance=serializer.instance)
         task = serializer.save()
         self._sync_linked_module_status(task, self.request.data.get("moduleBackendId"))
         added = [n for n in (task.assignees or []) if n not in before]
@@ -382,10 +379,10 @@ class TaskViewSet(viewsets.ModelViewSet):
         hint_module_id = request.data.get("moduleId")
         self._sync_linked_module_status(task, hint_module_id)
         if link:
-            _push_link_to_module(task, link, hint_module_id)
+            _push_link_to_module(task, link, hint_module_id, request)
         for att in new_attachments:
             if isinstance(att, dict) and att.get("type") == "link" and att.get("url"):
-                _push_link_to_module(task, att["url"], hint_module_id)
+                _push_link_to_module(task, att["url"], hint_module_id, request)
 
         return Response(TaskSerializer(task).data)
 
@@ -409,6 +406,23 @@ class TaskViewSet(viewsets.ModelViewSet):
         self._sync_linked_module_status(task, request.data.get("moduleId"))
         return Response(TaskSerializer(task).data)
 
+    @action(detail=True, methods=["post"], url_path="approve-handoff")
+    def approve_handoff(self, request, pk=None):
+        """POST /api/tasks/tasks/{id}/approve-handoff/ — the Tasks-page twin of
+        the Projects page's "Approve & send" button. Admin only."""
+        if request.user.role != "admin":
+            return Response({"error": "Only an admin can approve this."}, status=403)
+        task = self.get_object()
+        module = _resolve_task_module(task, request.data.get("moduleId"))
+        if module is None:
+            return Response({"error": "This task has no linked module."}, status=400)
+        from projects.handoff import approve_handoff as _approve
+
+        ok, message = _approve(module, request.user, request)
+        if not ok:
+            return Response({"error": message}, status=400)
+        return Response({"message": message})
+
     @action(detail=True, methods=["post"], url_path="add-attachment")
     def add_attachment(self, request, pk=None):
         """POST /api/tasks/tasks/{id}/add-attachment/  body: {"attachment": {...}}
@@ -423,7 +437,7 @@ class TaskViewSet(viewsets.ModelViewSet):
         task.save(update_fields=["attachments", "updated_at"])
         att = body.validated_data["attachment"]
         if isinstance(att, dict) and att.get("type") == "link" and att.get("url"):
-            _push_link_to_module(task, att["url"], request.data.get("moduleId"))
+            _push_link_to_module(task, att["url"], request.data.get("moduleId"), request)
         return Response(TaskSerializer(task).data)
 
     @action(detail=True, methods=["post"], url_path="remove-attachment")
@@ -650,7 +664,7 @@ class TaskViewSet(viewsets.ModelViewSet):
         if task.module_id:
             try:
                 zip_file.file.seek(0)  # rewind after TaskZipFile.save()
-                ModuleFile.objects.create(
+                mirrored_zip = ModuleFile.objects.create(
                     module_id=task.module_id,
                     file=zip_file.file,
                     original_name=file_obj.name,
@@ -658,6 +672,9 @@ class TaskViewSet(viewsets.ModelViewSet):
                     size=file_obj.size,
                     uploaded_by=request.user,
                 )
+                from projects.handoff import notify_new_file
+
+                notify_new_file(mirrored_zip, request.user, request)
             except Exception:  # noqa: BLE001
                 logger.exception("Task zip -> ModuleFile mirror failed")  # was a silent `pass`
 
@@ -719,6 +736,9 @@ class TaskViewSet(viewsets.ModelViewSet):
             size=file_obj.size,
             uploaded_by=request.user,
         )
+        from projects.handoff import notify_new_file
+
+        notify_new_file(module_file, request.user, request)
 
         # Build an absolute URL the browser can immediately open/download.
         file_url = request.build_absolute_uri(module_file.file.url)

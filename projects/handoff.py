@@ -3,20 +3,20 @@
 Employees are not allowed to message each other, so the work never goes
 straight from one member to the next:
 
-1. A module is marked Completed (Tasks page or Projects page).
-   -> its link / files / zips are sent to the ADMIN(s) as a normal chat
-      message, with a note saying who the next member is.
-2. An admin approves ("Approve & send" on the module, Projects page).
-   -> the same link / files / zips, plus "please continue with <next
-      module>", are sent from the admin to the next member.
-3. When that member finishes, the cycle repeats towards the one after them.
+1. Whenever a member attaches a NEW file or link to a module (or marks the
+   module Completed), the ADMIN(s) get ONE chat message for it - each file
+   and each link is announced exactly once (admin_notified_at /
+   handoff_url_notified), no matter how many pages or saves it goes through.
+2. An admin presses "Approve & send" (a button on the module - ticking the
+   module is NOT an approval). Everything not yet forwarded (forwarded_at /
+   handoff_url_forwarded) goes from the admin to the NEXT member, with
+   "please continue with <next module>".
+3. Attach something new later -> back to step 1; approve again -> only the
+   new items are forwarded.
 
-If an ADMIN is the one who ticks the module, that counts as the approval and
-step 2 happens immediately. Un-ticking a module resets everything, so ticking
-it again starts a fresh cycle. Never allowed to fail the tick itself.
+Never allowed to fail the action that triggered it.
 """
 import logging
-from datetime import timedelta
 
 from django.contrib.auth import get_user_model
 from django.core.files.base import ContentFile
@@ -97,136 +97,183 @@ def _deliver(sender, recipient, request, text="", content=None, name="", size=No
             logger.exception("Handoff websocket event to user %s failed", target_id)
 
 
-def _send_bundle(sender, recipient, request, module, intro_lines, closing_line, skip_recent_dupes):
-    """One text message (intro + link + file count + closing) followed by the
-    module's files, newest MAX_FILES. `skip_recent_dupes`: don't re-send a
-    file this same sender already sent this same recipient in the last 10
-    minutes (the Tasks page already forwards completion files to the admin
-    itself - this keeps the admin from getting every zip twice)."""
-    files = list(module.files.order_by("-uploaded_at", "-id")[:MAX_FILES])
-    files.reverse()
-    if skip_recent_dupes and files:
-        from messaging.models import Message
+def pending_items(module):
+    """(unforwarded files queryset, link-not-forwarded-yet?)"""
+    files = module.files.filter(forwarded_at__isnull=True)
+    url = (module.url or "").strip()
+    url_pending = bool(url) and url != (module.handoff_url_forwarded or "")
+    return files, url_pending
 
-        since = timezone.now() - timedelta(minutes=10)
-        already = set(
-            Message.objects.filter(
-                sender=sender, recipient=recipient, created_at__gte=since,
-                attachment_name__in=[f.original_name for f in files],
-            ).values_list("attachment_name", flat=True)
+
+def has_pending(module):
+    files, url_pending = pending_items(module)
+    return url_pending or files.exists()
+
+
+def _admins(exclude_id):
+    User = get_user_model()
+    return list(User.objects.filter(role="admin", status="approved", is_active=True).exclude(id=exclude_id))
+
+
+def _read_file(mf):
+    mf.file.open("rb")
+    try:
+        return mf.file.read()
+    finally:
+        mf.file.close()
+
+
+def _approve_hint(module):
+    nxt = find_next_module(module, module.assignee_id) if module.status == ModuleStatusChoices.COMPLETED else None
+    if nxt is None or nxt.assignee is None:
+        return ""
+    return (
+        f'⏳ Waiting for your approval to send this to {nxt.assignee.name} for "{nxt.name}". '
+        'Press "Approve & send" on the module (Projects page or Tasks page).'
+    )
+
+
+def _announce_to_admins(module, actor, request, files, link_url, headline):
+    """One message (+ the given files) from `actor` to every admin."""
+    admins = _admins(actor.id)
+    lines = [headline]
+    if link_url:
+        lines.append(f"🔗 Link: {link_url}")
+    if files:
+        lines.append(f"📎 {len(files)} file(s) attached below.")
+    hint = _approve_hint(module)
+    if hint:
+        lines.append(hint)
+    text = "\n".join(lines)
+    for admin in admins:
+        try:
+            _deliver(actor, admin, request, text=text)
+            for mf in files:
+                if (mf.size or 0) > MAX_FILE_BYTES:
+                    continue
+                data = _read_file(mf)
+                _deliver(
+                    actor, admin, request,
+                    content=ContentFile(data, name=mf.original_name),
+                    name=mf.original_name, size=len(data), mime=mf.mime_type,
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception("Handoff: announcing to admin %s failed", admin.id)
+
+
+def notify_new_file(module_file, actor, request):
+    """A file was just attached to a module -> tell the admin, once."""
+    try:
+        from .models import ModuleFile
+
+        if not ModuleFile.objects.filter(pk=module_file.pk, admin_notified_at__isnull=True).update(
+            admin_notified_at=timezone.now()
+        ):
+            return
+        if actor is None or actor.role == "admin":
+            return
+        module = module_file.module
+        _announce_to_admins(
+            module, actor, request, [module_file], "",
+            f'📎 {actor.name} attached "{module_file.original_name}" to "{module.name}" ({module.project.name}).',
         )
-        files = [f for f in files if f.original_name not in already]
-    sendable = [f for f in files if (f.size or 0) <= MAX_FILE_BYTES]
-    too_big = [f for f in files if (f.size or 0) > MAX_FILE_BYTES]
+    except Exception:  # noqa: BLE001
+        logger.exception("Handoff: notify_new_file failed for %s", getattr(module_file, "pk", None))
 
-    lines = list(intro_lines)
-    if module.url:
-        lines.append(f"🔗 Link: {module.url}")
+
+def notify_new_link(module, url, actor, request):
+    """A link was just set on a module -> tell the admin, once per link."""
+    try:
+        url = (url or "").strip()
+        if not url:
+            return
+        if not Module.objects.filter(pk=module.pk).exclude(handoff_url_notified=url).update(handoff_url_notified=url):
+            return
+        if actor is None or actor.role == "admin":
+            return
+        module.refresh_from_db()
+        _announce_to_admins(
+            module, actor, request, [], url,
+            f'🔗 {actor.name} attached a link to "{module.name}" ({module.project.name}).',
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Handoff: notify_new_link failed for %s", getattr(module, "pk", None))
+
+
+def _forward_to_next(module, approver, next_module, request):
+    recipient = next_module.assignee
+    if recipient is None or recipient.id == approver.id:
+        return False
+    files_qs, url_pending = pending_items(module)
+    files = list(files_qs.order_by("uploaded_at", "id"))
+    if not files and not url_pending:
+        return False
+    url = (module.url or "").strip()
+    # Claim everything first (once only), then send.
+    now = timezone.now()
+    from .models import ModuleFile
+
+    ModuleFile.objects.filter(pk__in=[f.pk for f in files], forwarded_at__isnull=True).update(forwarded_at=now)
+    Module.objects.filter(pk=module.pk).update(handoff_url_forwarded=url if url_pending else module.handoff_url_forwarded, handoff_sent_at=now)
+
+    sendable = [f for f in files if (f.size or 0) <= MAX_FILE_BYTES][-MAX_FILES:]
+    too_big = [f for f in files if (f.size or 0) > MAX_FILE_BYTES]
+    owner = module.assignee.name if module.assignee_id else "The previous member"
+    lines = [f'✅ {owner}\'s work on "{module.name}" ({module.project.name}) — approved by {approver.name}.']
+    if url_pending:
+        lines.append(f"🔗 Link: {url}")
     if sendable:
         lines.append(f"📎 {len(sendable)} file(s) attached below.")
     if too_big:
         lines.append("⚠️ Too large to forward here (download from the Projects page): " + ", ".join(f.original_name for f in too_big))
-    lines.append(closing_line)
-    _deliver(sender, recipient, request, text="\n".join(lines))
-
+    lines.append(f'➡️ Please continue with your next task: "{next_module.name}".')
+    _deliver(approver, recipient, request, text="\n".join(lines))
     for mf in sendable:
         try:
-            mf.file.open("rb")
-            try:
-                data = mf.file.read()
-            finally:
-                mf.file.close()
+            data = _read_file(mf)
             _deliver(
-                sender, recipient, request,
+                approver, recipient, request,
                 content=ContentFile(data, name=mf.original_name),
                 name=mf.original_name, size=len(data), mime=mf.mime_type,
             )
         except Exception:  # noqa: BLE001
             logger.exception("Handoff: could not forward file %s", mf.pk)
-
-
-def _forward_to_next(module, approver, next_module, request):
-    """Step 2: approver (an admin) -> next member."""
-    recipient = next_module.assignee
-    if recipient is None or recipient.id == approver.id:
-        return False
-    flipped = Module.objects.filter(pk=module.pk, handoff_sent_at__isnull=True).update(
-        handoff_sent_at=timezone.now()
-    )
-    if not flipped:
-        return False
-    owner = module.assignee.name if module.assignee_id else "The previous member"
-    _send_bundle(
-        approver, recipient, request, module,
-        intro_lines=[f'✅ {owner} completed "{module.name}" ({module.project.name}) — approved by {approver.name}.'],
-        closing_line=f'➡️ Please continue with your next task: "{next_module.name}".',
-        skip_recent_dupes=False,
-    )
     return True
 
 
-def request_handoff(module, actor, request):
-    """Step 1: module just got completed."""
-    ref_id = module.assignee_id or getattr(actor, "id", None)
-    next_module = find_next_module(module, ref_id)
-    if next_module is None:
-        return
-
-    # An admin ticking the module IS the approval.
-    if actor.role == "admin":
-        Module.objects.filter(pk=module.pk, handoff_requested_at__isnull=True).update(
-            handoff_requested_at=timezone.now()
-        )
-        _forward_to_next(module, actor, next_module, request)
-        return
-
-    flipped = Module.objects.filter(pk=module.pk, handoff_requested_at__isnull=True).update(
-        handoff_requested_at=timezone.now()
-    )
-    if not flipped:
-        return
-    User = get_user_model()
-    admins = User.objects.filter(role="admin", status="approved", is_active=True).exclude(id=actor.id)
-    for admin in admins:
-        try:
-            _send_bundle(
-                actor, admin, request, module,
-                intro_lines=[f'✅ {actor.name} completed "{module.name}" ({module.project.name}).'],
-                closing_line=(
-                    f'⏳ Waiting for your approval to send this to {next_module.assignee.name} '
-                    f'for "{next_module.name}". Approve it from Projects → the module → "Approve & send".'
-                ),
-                skip_recent_dupes=True,
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("Handoff: request to admin %s failed", admin.id)
-
-
 def approve_handoff(module, admin_user, request):
-    """Admin approval. Returns (ok, message)."""
-    if module.status != ModuleStatusChoices.COMPLETED:
-        return False, "This module is not completed."
-    if module.handoff_sent_at:
-        return False, "Already sent to the next member."
+    """Admin pressed "Approve & send". Returns (ok, message)."""
     next_module = find_next_module(module, module.assignee_id)
     if next_module is None:
         return False, "There is no next member to send this to."
-    if not Module.objects.filter(pk=module.pk, handoff_requested_at__isnull=True).update(
-        handoff_requested_at=timezone.now()
-    ):
-        pass  # already requested - fine
+    if not has_pending(module):
+        return False, "Nothing new to send — everything was already sent to the next member."
     if not _forward_to_next(module, admin_user, next_module, request):
         return False, "Could not send to the next member."
     return True, f"Sent to {next_module.assignee.name}."
 
 
 def handle_module_status_change(module, old_status, actor, request):
-    """Call after a module's status really changed."""
+    """Call after a module's status really changed. Completing a module
+    tells the admin (once for anything not announced yet); un-ticking just
+    lets it be completed again - nothing is resent to the next member."""
     try:
         if module.status == ModuleStatusChoices.COMPLETED and old_status != ModuleStatusChoices.COMPLETED:
-            request_handoff(module, actor, request)
-        elif module.status != ModuleStatusChoices.COMPLETED and old_status == ModuleStatusChoices.COMPLETED:
-            # un-ticked: ticking it again later starts a fresh cycle
-            Module.objects.filter(pk=module.pk).update(handoff_requested_at=None, handoff_sent_at=None)
+            if actor is None or actor.role == "admin":
+                return
+            module.refresh_from_db()
+            files = list(module.files.filter(admin_notified_at__isnull=True).order_by("uploaded_at", "id"))
+            if files:
+                from .models import ModuleFile
+
+                ModuleFile.objects.filter(pk__in=[f.pk for f in files]).update(admin_notified_at=timezone.now())
+            url = (module.url or "").strip()
+            link = url if url and url != (module.handoff_url_notified or "") else ""
+            if link:
+                Module.objects.filter(pk=module.pk).update(handoff_url_notified=link)
+            _announce_to_admins(
+                module, actor, request, files, link,
+                f'✅ {actor.name} completed "{module.name}" ({module.project.name}).',
+            )
     except Exception:  # noqa: BLE001
         logger.exception("Module hand-off failed for module %s", getattr(module, "pk", None))

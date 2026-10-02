@@ -96,11 +96,16 @@ class ModuleSerializer(serializers.ModelSerializer):
     handoff_next_name = serializers.SerializerMethodField()
 
     def get_handoff_status(self, obj):
+        # "pending": completed, something new (file/link) has not been
+        # forwarded yet, and there IS a next member -> admin sees the
+        # "Approve & send" button. "sent": completed and nothing left to send.
         if obj.status != "Completed":
             return ""
-        if obj.handoff_sent_at:
-            return "sent"
-        return "pending" if obj.handoff_requested_at else ""
+        from .handoff import find_next_module, has_pending
+
+        if has_pending(obj) and find_next_module(obj, obj.assignee_id) is not None:
+            return "pending"
+        return "sent" if obj.handoff_sent_at else ""
 
     def get_handoff_next_name(self, obj):
         if self.get_handoff_status(obj) != "pending":
