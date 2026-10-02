@@ -277,6 +277,13 @@ class ApprovedUsersView(APIView):
     def get(self, request):
         users = User.objects.filter(status="approved").exclude(role="client").order_by("name")
         data = [{"id": u.id, "name": u.name, "role": u.role} for u in users]
+        # Projects page -> module "Assign to": registered CLIENTS (portal
+        # logins) must be assignable too. Only added when asked for
+        # (?include_clients=1) and never for a client's own session, so every
+        # other caller of this endpoint keeps getting the exact same list.
+        if request.query_params.get("include_clients") and request.user.role != "client":
+            clients = User.objects.filter(status="approved", is_active=True, role="client").order_by("name")
+            data += [{"id": u.id, "name": u.name, "role": u.role} for u in clients]
         return Response(data)
 
 
