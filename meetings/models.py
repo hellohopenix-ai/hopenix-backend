@@ -66,6 +66,10 @@ class Meeting(models.Model):
     )
     # Notification bookkeeping (see meetings/reminders.py): each reminder is
     # sent once — "meeting today" (morning) and "starting in 15 minutes".
+    # Display names of participants who clicked "Join Meeting" (see
+    # MeetingViewSet.join). Once every participant is in here the meeting
+    # is auto-marked "Completed" so it never shows as "Missed".
+    attended_by = models.JSONField(default=list, blank=True)
     day_reminder_sent = models.BooleanField(default=False)
     soon_reminder_sent = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)

@@ -74,6 +74,14 @@ class MeetingViewSet(viewsets.ModelViewSet):
     serializer_class = MeetingSerializer
     permission_classes = [IsAuthenticatedReadManagerWrite]
 
+    def get_permissions(self):
+        # Joining is open to every authenticated participant (not just
+        # admin/manager). get_queryset() already hides meetings the user
+        # isn't part of, so get_object() 404s for outsiders.
+        if self.action == "join":
+            return [permissions.IsAuthenticated()]
+        return super().get_permissions()
+
     def get_queryset(self):
         qs = Meeting.objects.all()
         user = self.request.user
@@ -100,6 +108,34 @@ class MeetingViewSet(viewsets.ModelViewSet):
         created_by = serializer.validated_data.get("created_by") or _display_name(self.request.user)
         meeting = serializer.save(created_by=created_by, created_by_user=self.request.user)
         after_meeting_created(meeting, self.request.user)
+
+    @action(detail=True, methods=["post"], url_path="join")
+    def join(self, request, pk=None):
+        """POST /api/meetings/meetings/{id}/join/
+        Called when a participant clicks "Join Meeting". Records them in
+        `attended_by`; first join -> "In Progress", and once ALL
+        participants have joined the meeting becomes "Completed"
+        (successfully attended) instead of later showing as "Missed"."""
+
+        meeting = self.get_object()
+        if meeting.status in ("Cancelled", "Declined"):
+            return Response({"detail": "This meeting is no longer active."}, status=status.HTTP_400_BAD_REQUEST)
+
+        name = _display_name(request.user)
+        participants = [p for p in (meeting.participants or []) if p]
+        if name in participants and meeting.status != "Completed":
+            attended = list(meeting.attended_by or [])
+            if name not in attended:
+                attended.append(name)
+            meeting.attended_by = attended
+
+            required = {p for p in participants if p != "You"}
+            if required.issubset(set(attended)):
+                meeting.status = "Completed"
+            elif meeting.status in ("Upcoming", "Confirmed"):
+                meeting.status = "In Progress"
+            meeting.save(update_fields=["attended_by", "status", "updated_at"])
+        return Response(MeetingSerializer(meeting).data)
 
     @action(detail=True, methods=["post"], url_path="set-status")
     def set_status(self, request, pk=None):

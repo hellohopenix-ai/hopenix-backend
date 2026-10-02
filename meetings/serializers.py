@@ -16,6 +16,7 @@ class MeetingSerializer(serializers.ModelSerializer):
     rawTime = serializers.TimeField(source="raw_time", format="%H:%M", input_formats=["%H:%M", "%H:%M:%S"])
     meetLink = serializers.CharField(source="meet_link", required=False, allow_blank=True)
     createdBy = serializers.CharField(source="created_by", required=False, allow_blank=True)
+    attendedBy = serializers.ListField(source="attended_by", child=serializers.CharField(), read_only=True)
     createdAt = serializers.DateTimeField(source="created_at", read_only=True)
     updatedAt = serializers.DateTimeField(source="updated_at", read_only=True)
 
@@ -25,7 +26,7 @@ class MeetingSerializer(serializers.ModelSerializer):
             "id", "title", "type", "project",
             "rawDate", "rawTime",
             "participants", "status", "agenda", "meetLink",
-            "createdBy", "createdAt", "updatedAt",
+            "attendedBy", "createdBy", "createdAt", "updatedAt",
         ]
 
     def validate_participants(self, value):
