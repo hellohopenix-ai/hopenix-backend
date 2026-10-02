@@ -306,7 +306,14 @@ class TaskViewSet(viewsets.ModelViewSet):
             new_status = ModuleStatusChoices.IN_PROGRESS
         else:
             new_status = ModuleStatusChoices.PENDING
+        old_status = Module.objects.filter(pk=module.pk).values_list("status", flat=True).first()
         Module.objects.filter(pk=module.pk).exclude(status=new_status).update(status=new_status)
+        if old_status is not None and old_status != new_status:
+            # Finished work goes to the next member's chat automatically.
+            from projects.handoff import handle_module_status_change
+
+            module.status = new_status
+            handle_module_status_change(module, old_status, self.request.user, self.request)
 
     def perform_update(self, serializer):
         # Snapshot BEFORE save(): serializer.instance is updated in place,
@@ -380,6 +387,26 @@ class TaskViewSet(viewsets.ModelViewSet):
             if isinstance(att, dict) and att.get("type") == "link" and att.get("url"):
                 _push_link_to_module(task, att["url"], hint_module_id)
 
+        return Response(TaskSerializer(task).data)
+
+    @action(detail=True, methods=["post"])
+    def reopen(self, request, pk=None):
+        """POST /api/tasks/tasks/{id}/reopen/ — the "un-tick" of complete().
+        Back to Pending with every subtask open again; the linked Module goes
+        back to Pending too (and its hand-off cycle is reset, so ticking it
+        again later sends it to the admin afresh). Attachments are kept and
+        can still be added or deleted."""
+        task = self.get_object()
+        if task.locked:
+            return Response(
+                {"detail": "This module is locked until the client's request to start it is accepted."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        task.status = "Pending"
+        task.progress = 0
+        task.subtasks = [{**s, "done": False} for s in (task.subtasks or [])]
+        task.save()
+        self._sync_linked_module_status(task, request.data.get("moduleId"))
         return Response(TaskSerializer(task).data)
 
     @action(detail=True, methods=["post"], url_path="add-attachment")
@@ -470,7 +497,8 @@ class TaskViewSet(viewsets.ModelViewSet):
         elif att_id_str.isdigit():
             mf = ModuleFile.objects.filter(pk=int(att_id_str)).first()
             if mf:
-                if not module_id or mf.module_id != module_id:
+                owned = bool(entries) or (module_id and mf.module_id == module_id)
+                if not owned:
                     return Response({"error": "That file does not belong to this task's module."}, status=400)
                 deleted_module_file_ids.append(mf.id)
                 mf.file.delete(save=False)
@@ -493,7 +521,14 @@ class TaskViewSet(viewsets.ModelViewSet):
                     module.url_approved = False
                     module.url_approved_by = None
                     module.url_approved_at = None
+                    old_link = a_url
                     module.save(update_fields=["url", "url_approved", "url_approved_by", "url_approved_at", "updated_at"])
+                    try:
+                        from projects.views import mirror_module_url_to_tasks
+
+                        mirror_module_url_to_tasks(module, old_link)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("Module link -> task mirror failed")
 
         # 4) Legacy file (att-... id): the module sync uploaded it as its own
         #    ModuleFile without telling the task, so find it by name.

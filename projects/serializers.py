@@ -90,12 +90,32 @@ class ModuleSerializer(serializers.ModelSerializer):
     # NEW — real backend rows for ClientsPage.jsx's "sub-modules" (see
     # Module.parent in models.py). Empty for an ordinary module.
     subtasks = ModuleSubtaskSerializer(many=True, read_only=True)
+    # "" | "pending" (finished work is waiting for admin approval before it
+    # goes to the next member) | "sent" (forwarded). See projects/handoff.py.
+    handoff_status = serializers.SerializerMethodField()
+    handoff_next_name = serializers.SerializerMethodField()
+
+    def get_handoff_status(self, obj):
+        if obj.status != "Completed":
+            return ""
+        if obj.handoff_sent_at:
+            return "sent"
+        return "pending" if obj.handoff_requested_at else ""
+
+    def get_handoff_next_name(self, obj):
+        if self.get_handoff_status(obj) != "pending":
+            return ""
+        from .handoff import find_next_module
+
+        nxt = find_next_module(obj, obj.assignee_id)
+        return getattr(getattr(nxt, "assignee", None), "name", "") or ""
 
     class Meta:
         model = Module
         fields = [
             "id", "project", "parent", "name", "assignee", "assignee_name", "status",
             "priority", "due_date", "url", "url_approved", "price", "files", "unlocked", "subtasks",
+            "handoff_status", "handoff_next_name",
         ]
         read_only_fields = ["project", "url_approved"]
 

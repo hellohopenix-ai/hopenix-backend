@@ -167,6 +167,14 @@ class Module(models.Model):
     # created before this field existed don't suddenly all show as locked.
     unlocked = models.BooleanField(default=True)
 
+    # Hand-off to the next member (see projects/handoff.py). Completing a
+    # module sends its link/files to the ADMIN (handoff_requested_at); only
+    # when an admin approves are they forwarded to the next member
+    # (handoff_sent_at). Both are cleared if the module is un-ticked, so a
+    # re-tick starts the cycle again.
+    handoff_requested_at = models.DateTimeField(null=True, blank=True)
+    handoff_sent_at = models.DateTimeField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

@@ -546,12 +546,34 @@ class ModuleViewSet(viewsets.ModelViewSet):
             extra = dict(url_approved=False, url_approved_by=None, url_approved_at=None)
         module = serializer.save(**extra)
         self._mirror_module_to_tasks(module, old_status, old_assignee_name)
+        if module.status != old_status:
+            from .handoff import handle_module_status_change
+
+            handle_module_status_change(module, old_status, self.request.user, self.request)
         try:
             mirror_module_url_to_tasks(module, old_url)
         except Exception:  # noqa: BLE001
             logger.exception("Module link -> task mirror failed")
         if module.assignee_id and module.assignee_id != getattr(old_assignee, "id", None):
             self._notify_assignee(module)
+
+    @action(detail=True, methods=["post"], url_path="approve-handoff")
+    def approve_handoff(self, request, project_pk=None, pk=None):
+        """POST /api/projects/<project>/modules/<module>/approve-handoff/
+        Admin only. Forwards the finished module's link/files/zips (which
+        were sent to the admin when it was completed) to the next member."""
+        if request.user.role != "admin":
+            return Response({"error": "Only an admin can approve this."}, status=403)
+        from .handoff import approve_handoff as _approve
+
+        module = self.get_object()
+        ok, message = _approve(module, request.user, request)
+        if not ok:
+            return Response({"error": message}, status=400)
+        module.refresh_from_db()
+        data = ModuleSerializer(module, context={"request": request}).data
+        data["message"] = message
+        return Response(data)
 
     def _notify_assignee(self, module):
         """Sidebar dot + OS notification for the (new) module assignee.
