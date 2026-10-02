@@ -21,7 +21,13 @@ def visible_projects_queryset(user, base_queryset):
     if user.role == "admin":
         return qs
 
-    return qs.filter(Q(manager=user) | Q(team=user) | Q(created_by=user)).distinct()
+    # FIX: a person who has a MODULE assigned in the project must also see
+    # that project (and its team/group) on the Projects page, even if they
+    # were never added to `team` by hand — before this the module showed on
+    # the Tasks page but the project itself stayed invisible to them.
+    return qs.filter(
+        Q(manager=user) | Q(team=user) | Q(created_by=user) | Q(modules__assignee=user)
+    ).distinct()
 
 
 def can_access_project(user, project):
@@ -32,7 +38,11 @@ def can_access_project(user, project):
         return True
     if project.manager_id == user.id:
         return True
-    return project.team.filter(id=user.id).exists()
+    if project.team.filter(id=user.id).exists():
+        return True
+    # Module assignee (see visible_projects_queryset) — also what lets them
+    # attach a link/file to THEIR module without a 403.
+    return project.modules.filter(assignee_id=user.id).exists()
 
 
 def can_manage_project(user, project):

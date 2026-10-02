@@ -141,15 +141,38 @@ def _clear_project_zip_if_matches(task, zip_file):
 
 
 def _resolve_task_module(task, hint_module_id=None):
-    """The projects.Module this task belongs to: its own FK, else (older
-    tasks saved before the FK was stamped) the module id the frontend
-    knows — trusted only when that module is in the SAME client's project."""
+    """The projects.Module this task belongs to.
+
+    Order: (1) the task's own FK; (2) the module id the frontend sent, trusted
+    only when it sits in the SAME client's project (or, for a task with no
+    client, in the project with the SAME name); (3) a lookup by names
+    (project + module name), used only when it matches exactly ONE module.
+
+    FIX: step (2) used to need a client and step (3) did not exist, so every
+    task whose module was assigned from the Projects page (company projects,
+    or tasks created before Task.module was stamped) had no module -> a
+    pdf/file upload was refused with 400, a link never reached the module and
+    delete found nothing to delete."""
     if task.module_id:
         return task.module
-    if str(hint_module_id or "").isdigit() and task.client_id:
+    if str(hint_module_id or "").isdigit():
         candidate = Module.objects.select_related("project").filter(pk=int(hint_module_id)).first()
-        if candidate and candidate.project.client_id == task.client_id:
-            return candidate
+        if candidate:
+            if task.client_id and candidate.project.client_id == task.client_id:
+                return candidate
+            if not task.client_id and task.project and candidate.project.name == task.project:
+                return candidate
+    name = (task.module_name or "").strip() or (task.title or "").strip()
+    project_name = (task.module_project_name or task.project or "").strip()
+    if name and project_name:
+        qs = Module.objects.select_related("project").filter(
+            name=name, project__name=project_name, project__is_archived=False
+        )
+        if task.client_id:
+            qs = qs.filter(project__client_id=task.client_id)
+        found = list(qs[:2])
+        if len(found) == 1:
+            return found[0]
     return None
 
 
@@ -164,7 +187,7 @@ def _push_link_to_module(task, url, hint_module_id=None):
     review rule as ModuleViewSet.perform_update: a CHANGED link goes back to
     "pending review"."""
     url = (url or "").strip()
-    if not url or len(url) > 200 or not url.lower().startswith(("http://", "https://")):
+    if not url or len(url) > 500 or not url.lower().startswith(("http://", "https://")):
         return None
     module = _resolve_task_module(task, hint_module_id)
     if module is None:
@@ -400,13 +423,7 @@ class TaskViewSet(viewsets.ModelViewSet):
         att_id_str = "" if att_id is None else str(att_id)
 
         # The module whose files/link must be cleaned (see docstring).
-        module = task.module if task.module_id else None
-        if module is None:
-            hint_module_id = request.data.get("moduleId")
-            if str(hint_module_id).isdigit() and task.client_id:
-                candidate = Module.objects.select_related("project").filter(pk=int(hint_module_id)).first()
-                if candidate and candidate.project.client_id == task.client_id:
-                    module = candidate
+        module = _resolve_task_module(task, request.data.get("moduleId"))
         module_id = module.id if module else None
 
         def _is_target(a):
@@ -438,7 +455,8 @@ class TaskViewSet(viewsets.ModelViewSet):
         elif att_id_str.isdigit():
             mf = ModuleFile.objects.filter(pk=int(att_id_str)).first()
             if mf:
-                if not module_id or mf.module_id != module_id:
+                owned = bool(entries) or (module_id and mf.module_id == module_id)
+                if not owned:
                     return Response({"error": "That file does not belong to this task's module."}, status=400)
                 deleted_module_file_ids.append(mf.id)
                 mf.file.delete(save=False)
@@ -461,7 +479,14 @@ class TaskViewSet(viewsets.ModelViewSet):
                     module.url_approved = False
                     module.url_approved_by = None
                     module.url_approved_at = None
+                    old_link = a_url
                     module.save(update_fields=["url", "url_approved", "url_approved_by", "url_approved_at", "updated_at"])
+                    try:
+                        from projects.views import mirror_module_url_to_tasks
+
+                        mirror_module_url_to_tasks(module, old_link)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("Module link -> task mirror failed")
 
         # 4) Legacy file (att-... id): the module sync uploaded it as its own
         #    ModuleFile without telling the task, so find it by name.

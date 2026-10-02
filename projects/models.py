@@ -132,7 +132,9 @@ class Module(models.Model):
     status = models.CharField(max_length=20, choices=ModuleStatusChoices.choices, default=ModuleStatusChoices.PENDING)
     priority = models.CharField(max_length=10, choices=PriorityChoices.choices, default=PriorityChoices.MEDIUM)
     due_date = models.DateField(null=True, blank=True)
-    url = models.URLField(blank=True, default="")
+    # max_length 500: Django's default (200) silently rejected long
+    # staging/Drive/Figma links pasted from the Task page.
+    url = models.URLField(max_length=500, blank=True, default="")
     # NEW — same review gate ModuleFile.approved gives uploaded files, but for
     # the live/staging link. Before this, a link pasted on the Task Page went
     # straight onto the Client Portal with no admin review at all (only files
@@ -173,6 +175,14 @@ class Module(models.Model):
 
     def __str__(self):
         return f"{self.project.name} / {self.name}"
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        # FIX: whoever a module is assigned to becomes part of the project's
+        # team ("group"), so the project, its team and their module show up on
+        # their Projects page. add() is idempotent and never removes anyone.
+        if self.assignee_id:
+            self.project.team.add(self.assignee_id)
 
 
 class ModuleFile(models.Model):
