@@ -209,12 +209,16 @@ def _forward_to_next(module, approver, next_module, request):
     if not files and not url_pending:
         return False
     url = (module.url or "").strip()
-    # Claim everything first (once only), then send.
+    # Claim everything first (once only), then send. If the text message itself
+    # cannot be delivered the claim is undone, so the admin can press
+    # "Approve & send" again instead of being told "nothing new to send".
     now = timezone.now()
     from .models import ModuleFile
 
+    prev_url_forwarded = module.handoff_url_forwarded
+    prev_sent_at = module.handoff_sent_at
     ModuleFile.objects.filter(pk__in=[f.pk for f in files], forwarded_at__isnull=True).update(forwarded_at=now)
-    Module.objects.filter(pk=module.pk).update(handoff_url_forwarded=url if url_pending else module.handoff_url_forwarded, handoff_sent_at=now)
+    Module.objects.filter(pk=module.pk).update(handoff_url_forwarded=url if url_pending else prev_url_forwarded, handoff_sent_at=now)
 
     sendable = [f for f in files if (f.size or 0) <= MAX_FILE_BYTES][-MAX_FILES:]
     too_big = [f for f in files if (f.size or 0) > MAX_FILE_BYTES]
@@ -227,7 +231,13 @@ def _forward_to_next(module, approver, next_module, request):
     if too_big:
         lines.append("⚠️ Too large to forward here (download from the Projects page): " + ", ".join(f.original_name for f in too_big))
     lines.append(f'➡️ Please continue with your next task: "{next_module.name}".')
-    _deliver(approver, recipient, request, text="\n".join(lines))
+    try:
+        _deliver(approver, recipient, request, text="\n".join(lines))
+    except Exception:  # noqa: BLE001
+        logger.exception("Handoff: could not send the message to user %s", recipient.id)
+        ModuleFile.objects.filter(pk__in=[f.pk for f in files]).update(forwarded_at=None)
+        Module.objects.filter(pk=module.pk).update(handoff_url_forwarded=prev_url_forwarded, handoff_sent_at=prev_sent_at)
+        return False
     for mf in sendable:
         try:
             data = _read_file(mf)
@@ -238,6 +248,8 @@ def _forward_to_next(module, approver, next_module, request):
             )
         except Exception:  # noqa: BLE001
             logger.exception("Handoff: could not forward file %s", mf.pk)
+            # not delivered -> stays pending, so the next "Approve & send" retries it
+            ModuleFile.objects.filter(pk=mf.pk).update(forwarded_at=None)
     return True
 
 
@@ -277,3 +289,58 @@ def handle_module_status_change(module, old_status, actor, request):
             )
     except Exception:  # noqa: BLE001
         logger.exception("Module hand-off failed for module %s", getattr(module, "pk", None))
+
+
+def send_assignment_brief(module, assigner, request):
+    """A module was just assigned to someone -> send that person, in chat, a
+    text with the task + project details and the project's brief PDF/file.
+    Goes straight from the assigner (does not depend on the Messages contact
+    rules, so it can not be blocked by a 403). Sent once per identical text.
+    Never allowed to fail the assignment itself."""
+    try:
+        import re
+
+        assignee = module.assignee
+        if assignee is None or assigner is None or assignee.id == assigner.id:
+            return
+        project = module.project
+        manager = getattr(getattr(project, "manager", None), "name", "") or ""
+        lines = [f'📌 {assigner.name} assigned you "{module.name}" in {project.name}.']
+        if module.due_date:
+            lines.append(f"Due: {module.due_date}")
+        if manager:
+            lines.append(f"Manager: {manager}")
+        for label, value in (
+            ("Description", project.description),
+            ("Features", getattr(project, "features", "")),
+            ("Requirements", getattr(project, "requirements", "")),
+        ):
+            value = (value or "").strip()
+            if value:
+                lines.append(f"{label}:\n{value}")
+        text = "\n".join(lines)
+
+        from messaging.models import Message
+        from messaging.views import get_or_create_direct_conversation
+
+        conv = get_or_create_direct_conversation(assigner, assignee)
+        if Message.objects.filter(conversation=conv, sender=assigner, text=text, is_deleted=False).exists():
+            return
+        _deliver(assigner, assignee, request, text=text)
+
+        if project.brief and (project.brief.size or 0) <= MAX_FILE_BYTES:
+            name = re.sub(r"^[0-9a-fA-F-]{36}_", "", project.brief.name.split("/")[-1])
+            project.brief.open("rb")
+            try:
+                data = project.brief.read()
+            finally:
+                project.brief.close()
+            import mimetypes
+
+            _deliver(
+                assigner, assignee, request,
+                content=ContentFile(data, name=name),
+                name=name, size=len(data), mime=mimetypes.guess_type(name)[0] or "",
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("Handoff: assignment brief failed for module %s", getattr(module, "pk", None))

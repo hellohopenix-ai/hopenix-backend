@@ -14,6 +14,9 @@ project_zip_files = ProjectViewSet.as_view({"get": "zip_files"})
 module_list = ModuleViewSet.as_view({"get": "list", "post": "create"})
 module_detail = ModuleViewSet.as_view({"put": "partial_update", "patch": "partial_update", "delete": "destroy"})
 module_approve_url = ModuleViewSet.as_view({"post": "approve_url"})
+# FIX: "Approve & send" (admin -> next member) 404'd on the Projects page because
+# this hand-wired route was never registered (same cause as file_approve below).
+module_approve_handoff = ModuleViewSet.as_view({"post": "approve_handoff"})
 
 file_list = ModuleFileViewSet.as_view({"get": "list", "post": "create"})
 file_delete = ModuleFileViewSet.as_view({"delete": "destroy"})
@@ -38,6 +41,7 @@ urlpatterns = [
     path("<int:project_pk>/modules/", module_list, name="module-list"),
     path("<int:project_pk>/modules/<int:pk>/", module_detail, name="module-detail"),
     path("<int:project_pk>/modules/<int:pk>/approve-url/", module_approve_url, name="module-approve-url"),
+    path("<int:project_pk>/modules/<int:pk>/approve-handoff/", module_approve_handoff, name="module-approve-handoff"),
 
     path("<int:project_pk>/modules/<int:module_pk>/files/", file_list, name="file-list"),
     path("<int:project_pk>/modules/<int:module_pk>/files/<int:pk>/", file_delete, name="file-delete"),

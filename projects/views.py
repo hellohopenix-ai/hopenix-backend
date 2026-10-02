@@ -590,6 +590,10 @@ class ModuleViewSet(viewsets.ModelViewSet):
             notify_module_assigned(module, self.request.user)
         except Exception:  # noqa: BLE001
             logging.getLogger(__name__).exception("Module-assignment notification failed")
+        # Text + project brief PDF go to the new assignee's chat automatically.
+        from .handoff import send_assignment_brief
+
+        send_assignment_brief(module, self.request.user, self.request)
 
     # FIX (module ticked on the Projects page never reached the Tasks page):
     # the Task -> Module direction already existed (TaskViewSet.
