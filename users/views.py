@@ -397,8 +397,9 @@ class UpdateUserRoleView(APIView):
 
 class RemoveUserView(APIView):
     """DELETE /api/auth/users/<user_id>/remove/
-    Admin-only, permanent. Used by the row action menu's "Remove"
-    (ctxRemoveUser). Admin accounts can't be removed this way."""
+    Admin-only. Used by the row action menu's "Remove" (ctxRemoveUser).
+    Deactivates the account instead of deleting it — all their data and
+    messages are kept. Admin accounts can't be removed this way."""
 
     permission_classes = [IsAdmin]
 
@@ -409,7 +410,15 @@ class RemoveUserView(APIView):
             return Response({"error": "User not found."}, status=status.HTTP_404_NOT_FOUND)
         if target.role == "admin":
             return Response({"error": "Can't remove an Admin account."}, status=status.HTTP_400_BAD_REQUEST)
-        target.delete()
+        # NOT a hard delete anymore: the account is only DEACTIVATED, so the
+        # person loses access but every message, chat, task, project, file and
+        # record they ever created stays in the system (deleting the User row
+        # would cascade-delete their messages from other people's chats too).
+        # The admin can bring them back with Reactivate (SetUserStatusView).
+        target.status = "deactivated"
+        target.save(update_fields=["status"])
+        # End any session they currently have open.
+        Token.objects.filter(user=target).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
