@@ -187,7 +187,7 @@ class NotificationTestView(APIView):
 
 
 class SecuritySettingView(APIView):
-    """GET/PUT /api/settings/security/ — Security tab's 2FA toggle only.
+    """GET /api/settings/security/ — the real 2FA state (set up / disabled through /security/2fa/*).
     (Password change is its own endpoint below — see ChangePasswordView.)"""
 
     permission_classes = [permissions.IsAuthenticated]
@@ -197,11 +197,10 @@ class SecuritySettingView(APIView):
         return Response(SecuritySettingSerializer(obj).data)
 
     def put(self, request):
+        # 2FA can't be flipped with a flag any more (see SecuritySettingSerializer);
+        # kept so an older frontend that still PUTs here gets the real state back.
         obj, _ = SecuritySetting.objects.get_or_create(user=request.user)
-        serializer = SecuritySettingSerializer(obj, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return Response(serializer.data)
+        return Response(SecuritySettingSerializer(obj).data)
 
 
 class BillingInfoView(APIView):
@@ -690,3 +689,411 @@ class StorageUsageView(APIView):
         }
         for admin in admin_users():
             deliver(admin, payload, "system_alerts", email_subject=payload["title"], email_body=payload["body"])
+
+
+# ---------------------------------------------------------------------------
+# Security: real two-factor authentication
+# ---------------------------------------------------------------------------
+def _password_and_code_ok(request):
+    """-> (ok, error response). Needs the account password AND a valid code."""
+    from . import twofactor
+
+    password = request.data.get("password") or ""
+    code = request.data.get("code") or ""
+    if not request.user.check_password(password):
+        request.user.register_failed_login()
+        return False, Response({"error": "Password is incorrect."}, status=status.HTTP_400_BAD_REQUEST)
+    if not twofactor.check_login_code(request.user, code):
+        request.user.register_failed_login()
+        return False, Response({"error": "That code isn't valid."}, status=status.HTTP_400_BAD_REQUEST)
+    return True, None
+
+
+class TwoFactorSetupView(APIView):
+    """POST /api/settings/security/2fa/setup/ -> { secret, uri, qr } (qr = SVG data-URI)."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        from . import twofactor
+
+        if twofactor.get_setting(request.user).two_factor_enabled:
+            return Response({"error": "Two-factor authentication is already on."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(twofactor.begin_setup(request.user))
+
+
+class TwoFactorEnableView(APIView):
+    """POST /api/settings/security/2fa/enable/ { code } -> { backup_codes } (shown once)."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        from . import twofactor
+
+        codes = twofactor.confirm_setup(request.user, request.data.get("code"))
+        if codes is None:
+            return Response(
+                {"error": "That code isn't right. Check the 6 digits in your authenticator app (and your phone's clock) and try again."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        from reports.services import log_activity
+
+        log_activity(action="update", user=request.user, module="Settings", description="Turned on two-factor authentication")
+        return Response({"two_factor_enabled": True, "backup_codes": codes})
+
+
+class TwoFactorDisableView(APIView):
+    """POST /api/settings/security/2fa/disable/ { password, code }"""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        from . import twofactor
+        from reports.services import log_activity
+
+        if not twofactor.get_setting(request.user).two_factor_enabled:
+            return Response({"two_factor_enabled": False})
+        ok, error = _password_and_code_ok(request)
+        if not ok:
+            return error
+        twofactor.disable(request.user)
+        log_activity(action="update", user=request.user, module="Settings", description="Turned off two-factor authentication")
+        return Response({"two_factor_enabled": False})
+
+
+class TwoFactorBackupCodesView(APIView):
+    """POST /api/settings/security/2fa/backup-codes/ { password, code } — issue a fresh set."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        from . import twofactor
+
+        sec = twofactor.get_setting(request.user)
+        if not sec.two_factor_enabled:
+            return Response({"error": "Turn on two-factor authentication first."}, status=status.HTTP_400_BAD_REQUEST)
+        ok, error = _password_and_code_ok(request)
+        if not ok:
+            return error
+        plain, hashes = twofactor.make_backup_codes()
+        sec.refresh_from_db()
+        sec.backup_codes = hashes
+        sec.save(update_fields=["backup_codes", "updated_at"])
+        return Response({"backup_codes": plain})
+
+
+# ---------------------------------------------------------------------------
+# Security: sign-in history + "sign out other devices"
+# ---------------------------------------------------------------------------
+def _device_label(ua):
+    ua = ua or ""
+    if "Edg/" in ua or "EdgA/" in ua:
+        browser = "Edge"
+    elif "OPR/" in ua or "Opera" in ua:
+        browser = "Opera"
+    elif "Firefox/" in ua or "FxiOS" in ua:
+        browser = "Firefox"
+    elif "Chrome/" in ua or "CriOS" in ua:
+        browser = "Chrome"
+    elif "Safari/" in ua:
+        browser = "Safari"
+    else:
+        browser = "Browser"
+    if "Windows" in ua:
+        system = "Windows"
+    elif "Android" in ua:
+        system = "Android"
+    elif "iPhone" in ua or "iPad" in ua or "iOS" in ua:
+        system = "iPhone / iPad"
+    elif "Mac OS X" in ua or "Macintosh" in ua:
+        system = "macOS"
+    elif "Linux" in ua:
+        system = "Linux"
+    else:
+        system = "unknown device"
+    return f"{browser} on {system}"
+
+
+class SessionsView(APIView):
+    """GET /api/settings/security/sessions/ — the user's REAL recent sign-ins,
+    read from the activity log (device + IP + time)."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        from reports.models import ActivityLog
+
+        current_ua = (request.META.get("HTTP_USER_AGENT") or "")[:255]
+        rows = ActivityLog.objects.filter(user=request.user, action="login").order_by("-created_at")[:60]
+        seen, out, current_marked = set(), [], False
+        for r in rows:
+            key = (r.user_agent, r.ip_address)
+            if key in seen:
+                continue
+            seen.add(key)
+            is_current = (not current_marked) and r.user_agent == current_ua
+            current_marked = current_marked or is_current
+            out.append(
+                {
+                    "id": r.id,
+                    "device": _device_label(r.user_agent),
+                    "ip": r.ip_address or "",
+                    "signed_in_at": r.created_at.isoformat(),
+                    "method": "Google" if "Google" in (r.description or "") else "Password",
+                    "current": is_current,
+                }
+            )
+            if len(out) >= 8:
+                break
+        return Response({"sessions": out})
+
+
+class SignOutOthersView(APIView):
+    """POST /api/settings/security/sessions/revoke-others/ — every device signs in
+    with the same token, so this issues a brand-new one: all other devices lose
+    access at once and THIS device keeps working by switching to the token that
+    comes back (the frontend stores it)."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        from reports.services import log_activity
+
+        Token.objects.filter(user=request.user).delete()
+        token = Token.objects.create(user=request.user)
+        log_activity(action="logout", user=request.user, module="Auth", description="Signed out all other devices")
+        return Response({"token": token.key})
+
+
+# ---------------------------------------------------------------------------
+# System logs + system information
+# ---------------------------------------------------------------------------
+_WARNING_ACTIONS = ("login_failed", "login_blocked", "reject")
+
+
+def _log_level(row):
+    code = row.status_code or 0
+    if code >= 500:
+        return "error"
+    if row.action in _WARNING_ACTIONS or 400 <= code < 500:
+        return "warning"
+    return "info"
+
+
+class SystemLogsView(APIView):
+    """GET /api/settings/logs/?level=all|info|warning|error&limit=50 — admin. The real
+    audit trail (reports.ActivityLog), not a hard-coded list."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        if not is_admin(request.user):
+            return Response({"error": "Only admins can view system logs."}, status=status.HTTP_403_FORBIDDEN)
+        from django.db.models import Q
+        from reports.models import ActivityLog
+
+        level = request.query_params.get("level", "all")
+        try:
+            limit = max(1, min(int(request.query_params.get("limit", 50)), 200))
+        except ValueError:
+            limit = 50
+        qs = ActivityLog.objects.all()
+        warning_q = Q(action__in=_WARNING_ACTIONS) | Q(status_code__gte=400, status_code__lt=500)
+        error_q = Q(status_code__gte=500)
+        if level == "error":
+            qs = qs.filter(error_q)
+        elif level == "warning":
+            qs = qs.filter(warning_q).exclude(error_q)
+        elif level == "info":
+            qs = qs.exclude(warning_q).exclude(error_q)
+        out = []
+        for r in qs[:limit]:
+            label = ActivityLog.ACTION_LABELS.get(r.action, r.action)
+            out.append(
+                {
+                    "id": r.id,
+                    "level": _log_level(r),
+                    "message": r.description or f"{label} {r.object_repr}".strip(),
+                    "time": r.created_at.isoformat(),
+                    "actor": r.actor_name or r.actor_email or "System",
+                    "module": r.module,
+                }
+            )
+        return Response({"logs": out})
+
+
+_STARTED_AT = None
+
+
+def _started_at():
+    global _STARTED_AT
+    if _STARTED_AT is None:
+        from django.utils import timezone
+
+        _STARTED_AT = timezone.now()
+    return _STARTED_AT
+
+
+_started_at()  # remember when this server process started
+
+
+class SystemInfoView(APIView):
+    """GET /api/settings/system-info/ — real checks for the System Information card."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        import time as _time
+
+        from django.conf import settings as dj
+        from django.db import connection
+
+        db_ok, db_ms = True, None
+        try:
+            t0 = _time.perf_counter()
+            with connection.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+            db_ms = round((_time.perf_counter() - t0) * 1000)
+        except Exception:  # noqa: BLE001
+            db_ok = False
+
+        cache_ok = True
+        try:
+            cache.set("settings.sysinfo.ping", 1, 10)
+            cache_ok = cache.get("settings.sysinfo.ping") == 1
+        except Exception:  # noqa: BLE001
+            cache_ok = False
+
+        sha = os.environ.get("RAILWAY_GIT_COMMIT_SHA") or os.environ.get("GIT_COMMIT") or os.environ.get("SOURCE_VERSION") or ""
+        try:
+            from messaging.push_utils import describe_push_setup
+
+            push_ok = describe_push_setup(request.user)["configured"]
+        except Exception:  # noqa: BLE001
+            push_ok = False
+        email_ok = bool(getattr(dj, "DEFAULT_FROM_EMAIL", "")) and "console" not in str(getattr(dj, "EMAIL_BACKEND", "")).lower()
+
+        healthy = db_ok and cache_ok
+        return Response(
+            {
+                "version": sha[:7] if sha else "",
+                "started_at": _started_at().isoformat(),
+                "status": "operational" if healthy else "degraded",
+                "database": {"ok": db_ok, "latency_ms": db_ms, "engine": connection.vendor},
+                "cache": {"ok": cache_ok},
+                "storage": storage_usage.get_usage()["source"] if is_admin(request.user) else "",
+                "push_configured": push_ok,
+                "email_configured": email_ok,
+                # There is no backup job in this project, so say so rather than invent a date.
+                "backup": {"tracked": False, "note": "Backups are handled by your database host, not by this app."},
+            }
+        )
+
+
+# ---------------------------------------------------------------------------
+# Danger zone
+# ---------------------------------------------------------------------------
+class AccountDeletionView(APIView):
+    """GET/POST/DELETE /api/settings/account/delete-request/ — admin.
+    Records (and can cancel) a deletion REQUEST and alerts the other admins.
+    It never deletes anything by itself."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _open(self, user):
+        from .models import AccountDeletionRequest
+
+        return AccountDeletionRequest.objects.filter(user=user, cancelled_at__isnull=True).first()
+
+    def _out(self, req):
+        return {"requested": bool(req), "requested_at": req.requested_at.isoformat() if req else None}
+
+    def get(self, request):
+        return Response(self._out(self._open(request.user)))
+
+    def post(self, request):
+        if not is_admin(request.user):
+            return Response({"error": "Only admins can request account deletion."}, status=status.HTTP_403_FORBIDDEN)
+        from .models import AccountDeletionRequest
+
+        if not request.user.check_password(request.data.get("password") or ""):
+            return Response({"error": "Password is incorrect."}, status=status.HTTP_400_BAD_REQUEST)
+        req = self._open(request.user) or AccountDeletionRequest.objects.create(user=request.user)
+        payload = {
+            "type": "system.alert",
+            "title": "Account deletion requested",
+            "body": f"{request.user.name or request.user.email} asked to delete the company account. Nothing has been deleted.",
+        }
+        for admin in admin_users(exclude_ids=[request.user.id]):
+            deliver(admin, payload, "system_alerts", email_subject=payload["title"], email_body=payload["body"])
+        return Response(self._out(req), status=status.HTTP_201_CREATED)
+
+    def delete(self, request):
+        from django.utils import timezone
+
+        req = self._open(request.user)
+        if req:
+            req.cancelled_at = timezone.now()
+            req.save(update_fields=["cancelled_at"])
+        return Response(self._out(None))
+
+
+class SettingsResetView(APIView):
+    """POST /api/settings/reset/ — admin. Puts the preference settings back to their
+    defaults: Projects / Tasks / Income / Expenses / Sales, the display options on
+    General (language, currency, formats...), and YOUR notification choices.
+    It does NOT touch the company name/contact/address, logo, billing, users,
+    departments or anything people have created."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    GENERAL_PREFERENCE_FIELDS = [
+        "timezone", "currency", "date_format", "time_format", "default_dashboard",
+        "language", "compact_mode", "email_notifications", "auto_currency_update",
+    ]
+
+    def post(self, request):
+        if not is_admin(request.user):
+            return Response({"error": "Only admins can reset settings."}, status=status.HTTP_403_FORBIDDEN)
+        with transaction.atomic():
+            for model in (ProjectSettings, TaskSettings, IncomeSettings, ExpenseSettings, SalesSettings):
+                model.objects.all().delete()
+                model.load()
+            company = CompanySettings.load()
+            for name in self.GENERAL_PREFERENCE_FIELDS:
+                if hasattr(company, name):
+                    setattr(company, name, company._meta.get_field(name).get_default())
+            company.save()
+            NotificationPreference.objects.filter(user=request.user).delete()
+        return Response({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Read-only config for the rest of the app
+# ---------------------------------------------------------------------------
+class AppConfigView(APIView):
+    """GET /api/settings/app-config/ — any logged-in user. The saved module settings
+    (categories, statuses, rules) so pages other than Settings can use them.
+    Also runs the hourly auto-archive sweep (Settings -> Projects)."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        from . import rules
+
+        rules.maybe_archive()
+        company = CompanySettings.load()
+        return Response(
+            {
+                "company": {
+                    "currency": company.currency, "timezone": company.timezone, "date_format": company.date_format,
+                    "time_format": company.time_format, "language": company.language,
+                },
+                "projects": ProjectSettingsSerializer(ProjectSettings.load()).data,
+                "tasks": TaskSettingsSerializer(TaskSettings.load()).data,
+                "income": IncomeSettingsSerializer(IncomeSettings.load()).data,
+                "expenses": ExpenseSettingsSerializer(ExpenseSettings.load()).data,
+                "sales": SalesSettingsSerializer(SalesSettings.load()).data,
+            }
+        )

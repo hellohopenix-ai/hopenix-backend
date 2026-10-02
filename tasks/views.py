@@ -260,7 +260,12 @@ class TaskViewSet(viewsets.ModelViewSet):
         created_by = serializer.validated_data.get("created_by") or getattr(
             self.request.user, "name", ""
         ) or "Admin"
-        task = serializer.save(created_by=created_by)
+        # Settings -> Tasks: required due date / subtasks switch / auto-assign lead.
+        from settings.rules import default_assignees_for, enforce_task_rules
+
+        enforce_task_rules(serializer.validated_data)
+        lead = default_assignees_for(serializer.validated_data)
+        task = serializer.save(created_by=created_by, **({"assignees": lead} if lead else {}))
         self._notify_new_assignees([(task, list(task.assignees or []))])
 
     def _notify_new_assignees(self, assignments):
@@ -307,6 +312,9 @@ class TaskViewSet(viewsets.ModelViewSet):
         # Snapshot BEFORE save(): serializer.instance is updated in place,
         # so afterwards the old assignee list would be gone.
         before = set(serializer.instance.assignees or [])
+        from settings.rules import enforce_task_rules
+
+        enforce_task_rules(serializer.validated_data, instance=serializer.instance)
         task = serializer.save()
         self._sync_linked_module_status(task, self.request.data.get("moduleBackendId"))
         added = [n for n in (task.assignees or []) if n not in before]
@@ -462,8 +470,7 @@ class TaskViewSet(viewsets.ModelViewSet):
         elif att_id_str.isdigit():
             mf = ModuleFile.objects.filter(pk=int(att_id_str)).first()
             if mf:
-                owned = bool(entries) or (module_id and mf.module_id == module_id)
-                if not owned:
+                if not module_id or mf.module_id != module_id:
                     return Response({"error": "That file does not belong to this task's module."}, status=400)
                 deleted_module_file_ids.append(mf.id)
                 mf.file.delete(save=False)
@@ -486,14 +493,7 @@ class TaskViewSet(viewsets.ModelViewSet):
                     module.url_approved = False
                     module.url_approved_by = None
                     module.url_approved_at = None
-                    old_link = a_url
                     module.save(update_fields=["url", "url_approved", "url_approved_by", "url_approved_at", "updated_at"])
-                    try:
-                        from projects.views import mirror_module_url_to_tasks
-
-                        mirror_module_url_to_tasks(module, old_link)
-                    except Exception:  # noqa: BLE001
-                        logger.exception("Module link -> task mirror failed")
 
         # 4) Legacy file (att-... id): the module sync uploaded it as its own
         #    ModuleFile without telling the task, so find it by name.

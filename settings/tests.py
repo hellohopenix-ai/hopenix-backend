@@ -325,3 +325,275 @@ class BillingTests(BaseCase):
     def test_only_admin_can_change(self):
         auth(self.client, self.emp)
         self.assertEqual(self.client.put(self.url, {"plan_name": "Starter"}, format="json").status_code, 403)
+
+
+# ---------------------------------------------------------------------------
+# Security: 2FA, sign-in history, logs, system info, danger zone
+# ---------------------------------------------------------------------------
+import time as _time
+
+import pyotp
+
+
+def current_code(secret):
+    return pyotp.TOTP(secret).now()
+
+
+def next_code(secret):
+    """The code for the NEXT 30s step (so a test can log in twice in a row)."""
+    return pyotp.TOTP(secret).at(int(_time.time()) + 30)
+
+
+class TwoFactorTests(BaseCase):
+    def enable(self):
+        auth(self.client, self.admin)
+        setup = self.client.post("/api/settings/security/2fa/setup/")
+        self.assertEqual(setup.status_code, 200, setup.data)
+        self.assertTrue(setup.data["qr"].startswith("data:image/svg+xml"))
+        self.assertIn("otpauth://totp/", setup.data["uri"])
+        res = self.client.post("/api/settings/security/2fa/enable/", {"code": current_code(setup.data["secret"])}, format="json")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(len(res.data["backup_codes"]), 8)
+        return setup.data["secret"], res.data["backup_codes"]
+
+    def test_flag_cannot_turn_2fa_on_or_off(self):
+        auth(self.client, self.admin)
+        self.client.put("/api/settings/security/", {"two_factor_enabled": True}, format="json")
+        self.assertFalse(self.client.get("/api/settings/security/").data["two_factor_enabled"])
+
+    def test_wrong_code_does_not_enable(self):
+        auth(self.client, self.admin)
+        self.client.post("/api/settings/security/2fa/setup/")
+        res = self.client.post("/api/settings/security/2fa/enable/", {"code": "000000"}, format="json")
+        self.assertEqual(res.status_code, 400)
+        self.assertFalse(self.client.get("/api/settings/security/").data["two_factor_enabled"])
+
+    def test_login_needs_the_code_once_enabled(self):
+        secret, backup = self.enable()
+        self.client.credentials()
+        # password only -> no token, asks for the code
+        res = self.client.post("/api/auth/login/", {"email": "admin@x.com", "password": "pass12345"}, format="json")
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res.data["otp_required"])
+        self.assertNotIn("token", res.data)
+        # wrong code
+        bad = self.client.post("/api/auth/login/", {"email": "admin@x.com", "password": "pass12345", "otp": "123456"}, format="json")
+        self.assertEqual(bad.status_code, 401)
+        # right code (the setup code was already used, so use the next step's code)
+        ok = self.client.post("/api/auth/login/", {"email": "admin@x.com", "password": "pass12345", "otp": next_code(secret)}, format="json")
+        self.assertEqual(ok.status_code, 200, ok.data)
+        self.assertIn("token", ok.data)
+        # the same code can't be replayed
+        again = self.client.post("/api/auth/login/", {"email": "admin@x.com", "password": "pass12345", "otp": next_code(secret)}, format="json")
+        self.assertEqual(again.status_code, 401)
+
+    def test_backup_code_works_exactly_once(self):
+        _secret, backup = self.enable()
+        self.client.credentials()
+        body = {"email": "admin@x.com", "password": "pass12345", "otp": backup[0]}
+        self.assertEqual(self.client.post("/api/auth/login/", body, format="json").status_code, 200)
+        self.assertEqual(self.client.post("/api/auth/login/", body, format="json").status_code, 401)
+
+    def test_google_login_also_needs_the_code(self):
+        secret, _ = self.enable()
+        self.client.credentials()
+        fake = mock.Mock(status_code=200)
+        fake.json.return_value = {"email": "admin@x.com"}
+        with mock.patch("users.views.google_requests.get", return_value=fake):
+            res = self.client.post("/api/auth/google-login/", {"access_token": "x"}, format="json")
+            self.assertTrue(res.data.get("otp_required"))
+            self.assertNotIn("token", res.data)
+            ok = self.client.post("/api/auth/google-login/", {"access_token": "x", "otp": next_code(secret)}, format="json")
+        self.assertIn("token", ok.data)
+
+    def test_disable_needs_password_and_code(self):
+        secret, _ = self.enable()
+        url = "/api/settings/security/2fa/disable/"
+        self.assertEqual(self.client.post(url, {"password": "nope", "code": next_code(secret)}, format="json").status_code, 400)
+        self.assertEqual(self.client.post(url, {"password": "pass12345", "code": "000000"}, format="json").status_code, 400)
+        ok = self.client.post(url, {"password": "pass12345", "code": next_code(secret)}, format="json")
+        self.assertEqual(ok.status_code, 200)
+        self.assertFalse(self.client.get("/api/settings/security/").data["two_factor_enabled"])
+        # login is back to password only
+        self.client.credentials()
+        res = self.client.post("/api/auth/login/", {"email": "admin@x.com", "password": "pass12345"}, format="json")
+        self.assertIn("token", res.data)
+
+    def test_secret_is_not_stored_in_plain_text(self):
+        secret, _ = self.enable()
+        from .models import SecuritySetting
+
+        self.assertNotIn(secret, SecuritySetting.objects.get(user=self.admin).totp_secret)
+
+
+class SessionsLogsInfoTests(BaseCase):
+    def login(self, email="admin@x.com"):
+        self.client.credentials()
+        res = self.client.post("/api/auth/login/", {"email": email, "password": "pass12345"}, format="json", HTTP_USER_AGENT="Mozilla/5.0 (Windows NT 10.0) Chrome/120.0 Safari/537.36")
+        self.assertEqual(res.status_code, 200, res.data)
+        return res.data["token"]
+
+    def test_sessions_come_from_real_sign_ins(self):
+        token = self.login()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Token {token}", HTTP_USER_AGENT="Mozilla/5.0 (Windows NT 10.0) Chrome/120.0 Safari/537.36")
+        rows = self.client.get("/api/settings/security/sessions/").data["sessions"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["device"], "Chrome on Windows")
+        self.assertTrue(rows[0]["current"])
+
+    def test_sign_out_others_rotates_the_token(self):
+        old = self.login()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Token {old}")
+        res = self.client.post("/api/settings/security/sessions/revoke-others/")
+        self.assertEqual(res.status_code, 200)
+        new = res.data["token"]
+        self.assertNotEqual(old, new)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Token {old}")
+        self.assertEqual(self.client.get("/api/settings/security/").status_code, 401)  # other devices are out
+        self.client.credentials(HTTP_AUTHORIZATION=f"Token {new}")
+        self.assertEqual(self.client.get("/api/settings/security/").status_code, 200)  # this one keeps working
+
+    def test_logs_are_real_and_admin_only(self):
+        self.login()  # writes a "login" activity row
+        self.client.credentials()
+        self.client.post("/api/auth/login/", {"email": "admin@x.com", "password": "WRONG-pass1"}, format="json")  # failed login
+        auth(self.client, self.admin)
+        logs = self.client.get("/api/settings/logs/").data["logs"]
+        self.assertTrue(any("Failed login" in l["message"] and l["level"] == "warning" for l in logs), logs)
+        warn = self.client.get("/api/settings/logs/?level=warning").data["logs"]
+        self.assertTrue(warn and all(l["level"] == "warning" for l in warn))
+        info = self.client.get("/api/settings/logs/?level=info").data["logs"]
+        self.assertTrue(all(l["level"] == "info" for l in info))
+        auth(self.client, self.emp)
+        self.assertEqual(self.client.get("/api/settings/logs/").status_code, 403)
+
+    def test_system_info_is_measured(self):
+        auth(self.client, self.admin)
+        res = self.client.get("/api/settings/system-info/")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["status"], "operational")
+        self.assertTrue(res.data["database"]["ok"])
+        self.assertIsNotNone(res.data["database"]["latency_ms"])
+        self.assertFalse(res.data["backup"]["tracked"])  # no invented backup date
+
+    def test_deletion_is_only_a_recorded_request(self):
+        auth(self.client, self.admin)
+        url = "/api/settings/account/delete-request/"
+        self.assertEqual(self.client.post(url, {"password": "wrong"}, format="json").status_code, 400)
+        with mock.patch("settings.views.deliver") as d:
+            res = self.client.post(url, {"password": "pass12345"}, format="json")
+        self.assertEqual(res.status_code, 201)
+        self.assertTrue(self.client.get(url).data["requested"])
+        self.assertTrue(User.objects.filter(pk=self.admin.pk).exists())  # nothing deleted
+        self.assertFalse(self.client.delete(url).data["requested"])      # can be cancelled
+        auth(self.client, self.emp)
+        self.assertEqual(self.client.post(url, {"password": "pass12345"}, format="json").status_code, 403)
+
+    def test_reset_restores_preferences_but_keeps_identity(self):
+        auth(self.client, self.admin)
+        self.client.put("/api/settings/company/", {"name": "Acme Ltd", "currency": "EUR"}, format="json")
+        self.client.put("/api/settings/sales/", {"tax_rate": 17}, format="json")
+        self.assertEqual(self.client.post("/api/settings/reset/").status_code, 200)
+        self.assertEqual(float(self.client.get("/api/settings/sales/").data["tax_rate"]), 0.0)
+        self.assertEqual(self.client.get("/api/settings/company/").data["name"], "Acme Ltd")
+        self.assertNotEqual(self.client.get("/api/settings/company/").data["currency"], "EUR")
+        auth(self.client, self.emp)
+        self.assertEqual(self.client.post("/api/settings/reset/").status_code, 403)
+
+    def test_app_config_for_any_user(self):
+        auth(self.client, self.emp)
+        res = self.client.get("/api/settings/app-config/")
+        self.assertEqual(res.status_code, 200)
+        for key in ("company", "projects", "tasks", "income", "expenses", "sales"):
+            self.assertIn(key, res.data)
+
+
+class SettingsAreEnforcedTests(BaseCase):
+    def test_task_rules(self):
+        from .models import TaskSettings
+
+        auth(self.client, self.admin)
+        base = {"title": "T", "project": "P"}
+        self.assertEqual(self.client.post("/api/tasks/tasks/", base, format="json").status_code, 201)  # off by default
+        cfg = TaskSettings.load()
+        cfg.require_due_date = True
+        cfg.allow_subtasks = False
+        cfg.save()
+        res = self.client.post("/api/tasks/tasks/", base, format="json")
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("dueDate", res.data)
+        ok = self.client.post("/api/tasks/tasks/", {**base, "dueDate": "2030-01-01"}, format="json")
+        self.assertEqual(ok.status_code, 201, ok.data)
+        sub = self.client.post("/api/tasks/tasks/", {**base, "dueDate": "2030-01-01", "subtasks": [{"title": "a", "done": False}]}, format="json")
+        self.assertEqual(sub.status_code, 400)
+        self.assertIn("subtasks", sub.data)
+
+    def test_auto_assign_lead(self):
+        from projects.models import Project
+        from .models import TaskSettings
+
+        Project.objects.create(name="Alpha", manager=self.emp, created_by=self.admin)
+        cfg = TaskSettings.load()
+        cfg.auto_assign_lead = True
+        cfg.save()
+        auth(self.client, self.admin)
+        res = self.client.post("/api/tasks/tasks/", {"title": "T", "project": "Alpha"}, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(res.data["assignees"], [self.emp.name])
+        explicit = self.client.post("/api/tasks/tasks/", {"title": "T2", "project": "Alpha", "assignees": ["Someone"]}, format="json")
+        self.assertEqual(explicit.data["assignees"], ["Someone"])  # an explicit choice is never overridden
+
+    def expense(self, amount, **extra):
+        return self.client.post(
+            "/api/expenses/expenses/",
+            {"title": "Pens", "category": "Office", "project": "P", "amount": amount, "date": "2030-01-01", "payment": "Cash", **extra},
+            format="json",
+        )
+
+    def test_expense_threshold_auto_approves_small_amounts(self):
+        from .models import ExpenseSettings
+
+        auth(self.client, self.admin)
+        self.assertEqual(self.expense(100).data["status"], "Pending")  # off by default
+        cfg = ExpenseSettings.load()
+        cfg.approval_threshold = 1000
+        cfg.require_receipt = False
+        cfg.save()
+        self.assertEqual(self.expense(500).data["status"], "Approved")
+        self.assertEqual(self.expense(5000).data["status"], "Pending")  # above threshold needs a person
+
+    def test_receipt_is_required_before_approval(self):
+        from .models import ExpenseSettings
+
+        cfg = ExpenseSettings.load()
+        cfg.require_receipt = True
+        cfg.approval_threshold = 1000
+        cfg.save()
+        auth(self.client, self.admin)
+        created = self.expense(500)
+        self.assertEqual(created.data["status"], "Pending")  # no receipt yet -> not auto-approved
+        eid = created.data["id"]
+        self.assertEqual(self.client.patch(f"/api/expenses/expenses/{eid}/", {"status": "Approved"}, format="json").status_code, 400)
+        up = SimpleUploadedFile("r.png", png_bytes(), content_type="image/png")
+        self.assertEqual(self.client.post(f"/api/expenses/expenses/{eid}/receipt/", {"receipt": up}, format="multipart").status_code, 201)
+        self.assertEqual(self.client.get(f"/api/expenses/expenses/{eid}/").data["status"], "Approved")  # small + receipt -> auto-approved
+
+    def test_auto_archive_completed_projects(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+        from projects.models import Project
+        from .rules import archive_old_completed_projects
+
+        old = Project.objects.create(name="Old", status="Completed", created_by=self.admin)
+        fresh = Project.objects.create(name="Fresh", status="Completed", created_by=self.admin)
+        Project.objects.filter(pk=old.pk).update(updated_at=timezone.now() - timedelta(days=45))
+        self.assertEqual(archive_old_completed_projects(), 1)
+        old.refresh_from_db(); fresh.refresh_from_db()
+        self.assertTrue(old.is_archived)
+        self.assertFalse(fresh.is_archived)
+        from .models import ProjectSettings
+
+        cfg = ProjectSettings.load(); cfg.auto_archive = False; cfg.save()
+        Project.objects.filter(pk=fresh.pk).update(updated_at=timezone.now() - timedelta(days=45))
+        self.assertEqual(archive_old_completed_projects(), 0)  # switched off

@@ -3,6 +3,7 @@ from django.contrib import admin
 from .models import (
     BillingInfo,
     CompanySettings,
+    AccountDeletionRequest,
     BillingEvent,
     Department,
     ExpenseSettings,
@@ -17,6 +18,7 @@ from .models import (
 admin.site.register(CompanySettings)
 admin.site.register(Department)
 admin.site.register(BillingEvent)
+admin.site.register(AccountDeletionRequest)
 admin.site.register(NotificationPreference)
 admin.site.register(SecuritySetting)
 admin.site.register(BillingInfo)

@@ -91,7 +91,20 @@ class SecuritySetting(models.Model):
         on_delete=models.CASCADE,
         related_name="security_setting",
     )
+    # True ONLY after the user proved they can generate codes (see
+    # twofactor.py). It is read-only over the API: it can't be switched on
+    # or off by just sending a flag — that would either lock the user out
+    # (on, with no secret) or silently bypass 2FA (off).
     two_factor_enabled = models.BooleanField(default=False)
+    # Authenticator secret, encrypted at rest (twofactor.encrypt). `pending`
+    # holds a secret during setup, before the first code is confirmed.
+    totp_secret = models.CharField(max_length=255, blank=True, default="")
+    totp_pending_secret = models.CharField(max_length=255, blank=True, default="")
+    # SHA-256 hashes of the unused one-time backup codes.
+    backup_codes = models.JSONField(default=list, blank=True)
+    # Last accepted 30-second time step: a code can't be replayed.
+    totp_last_step = models.BigIntegerField(default=0)
+    two_factor_enabled_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
@@ -299,3 +312,18 @@ class Department(models.Model):
 
     def __str__(self):
         return self.name
+
+
+
+class AccountDeletionRequest(models.Model):
+    """Settings -> Danger Zone -> Delete Account. This only RECORDS the
+    request (and alerts the other admins). Nothing is deleted automatically:
+    wiping a company's data must be a deliberate step by a person with
+    database access, never a button that fires on its own after N days."""
+
+    user = models.ForeignKey(django_settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="deletion_requests")
+    requested_at = models.DateTimeField(auto_now_add=True)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-requested_at"]

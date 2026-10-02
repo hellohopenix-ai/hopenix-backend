@@ -69,3 +69,5 @@ whitenoise==6.12.0
 wrapt==2.4.1
 yarl==1.25.1
 zope.interface==8.6
+pyotp==2.10.0
+segno==1.6.6

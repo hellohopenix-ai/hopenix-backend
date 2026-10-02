@@ -57,10 +57,19 @@ class NotificationPreferenceSerializer(serializers.ModelSerializer):
 
 
 class SecuritySettingSerializer(serializers.ModelSerializer):
+    """Read-only on purpose. `two_factor_enabled` can only change through the
+    verified setup / disable endpoints (twofactor.py) — a client sending a
+    flag must never be able to switch 2FA on or off."""
+
+    backup_codes_left = serializers.SerializerMethodField()
+
+    def get_backup_codes_left(self, obj):
+        return len(obj.backup_codes or [])
+
     class Meta:
         model = SecuritySetting
-        fields = ["two_factor_enabled", "updated_at"]
-        read_only_fields = ["updated_at"]
+        fields = ["two_factor_enabled", "two_factor_enabled_at", "backup_codes_left", "updated_at"]
+        read_only_fields = fields
 
 
 class BillingInfoSerializer(serializers.ModelSerializer):

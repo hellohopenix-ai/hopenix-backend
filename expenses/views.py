@@ -65,11 +65,20 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         return qs
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        # Settings -> Expenses: amounts up to the approval threshold are approved automatically.
+        from settings.rules import apply_expense_create_rules
+
+        serializer.save(created_by=self.request.user, **apply_expense_create_rules(serializer.validated_data))
 
     def perform_update(self, serializer):
         if not can_edit_expense(self.request.user, self.get_object()):
             raise PermissionDenied("You can't edit this expense.")
+        # Settings -> Expenses: with "Require Receipt" on, no approval without a receipt.
+        from settings.rules import enforce_expense_approval
+
+        new_status = serializer.validated_data.get("status")
+        if new_status and new_status != serializer.instance.status:
+            enforce_expense_approval(new_status, bool(serializer.instance.receipt_file))
         serializer.save()
 
     def perform_destroy(self, instance):
@@ -110,6 +119,13 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         expense.receipt_name = file_obj.name
         expense.receipt_content_type = file_obj.content_type
         expense.save(update_fields=["receipt_file", "receipt_name", "receipt_content_type", "updated_at"])
+        # Settings -> Expenses: now that there IS a receipt, a small expense can be auto-approved.
+        if expense.status == "Pending":
+            from settings.rules import apply_expense_create_rules
+
+            if apply_expense_create_rules({"amount": expense.amount}, has_receipt=True).get("status") == "Approved":
+                expense.status = "Approved"
+                expense.save(update_fields=["status", "updated_at"])
         return Response(ExpenseSerializer(expense, context={"request": request}).data, status=201)
 
     # -- Stat cards + category breakdown ---------------------------------

@@ -97,6 +97,27 @@ class LoginView(APIView):
             )
             return Response({"error": "Invalid email or password."}, status=status.HTTP_401_UNAUTHORIZED)
 
+
+        # Settings -> Security: two-factor authentication. The password (or Google
+        # identity) was right; if this account has 2FA on, the authenticator code
+        # is required too. No token is issued until it is valid.
+        from settings.twofactor import check_login_code, requires_otp
+
+        if requires_otp(user):
+            otp = str(request.data.get("otp") or "").strip()
+            if not otp:
+                return Response({"otp_required": True, "error": "Enter the 6-digit code from your authenticator app."})
+            if not check_login_code(user, otp):
+                user.register_failed_login()
+                log_activity(
+                    action="login_failed", module="Auth", description="Wrong two-factor code for %s" % user.email,
+                    actor_email=user.email, metadata={"email": user.email}, dedupe_seconds=30,
+                )
+                return Response(
+                    {"otp_required": True, "error": "That code isn't valid. Try again, or use one of your backup codes."},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+
         user.reset_failed_login()
         token, _ = Token.objects.get_or_create(user=user)
         log_activity(action="login", user=user, module="Auth", description="Logged in")
@@ -839,6 +860,27 @@ class GoogleLoginView(APIView):
                 {"error": "No account exists for this email. Please sign up first."},
                 status=status.HTTP_404_NOT_FOUND,
             )
+
+
+        # Settings -> Security: two-factor authentication. The password (or Google
+        # identity) was right; if this account has 2FA on, the authenticator code
+        # is required too. No token is issued until it is valid.
+        from settings.twofactor import check_login_code, requires_otp
+
+        if requires_otp(user):
+            otp = str(request.data.get("otp") or "").strip()
+            if not otp:
+                return Response({"otp_required": True, "error": "Enter the 6-digit code from your authenticator app."})
+            if not check_login_code(user, otp):
+                user.register_failed_login()
+                log_activity(
+                    action="login_failed", module="Auth", description="Wrong two-factor code for %s" % user.email,
+                    actor_email=user.email, metadata={"email": user.email}, dedupe_seconds=30,
+                )
+                return Response(
+                    {"otp_required": True, "error": "That code isn't valid. Try again, or use one of your backup codes."},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
 
         token, _ = Token.objects.get_or_create(user=user)
         log_activity(action="login", user=user, module="Auth", description="Logged in with Google")
