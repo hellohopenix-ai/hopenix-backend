@@ -558,7 +558,7 @@ def daily_queryset(request, full):
 
 class DailyReportListCreateView(ReportsAPIView):
     """GET  /api/reports/daily/   filters: user, date, project, status, q, start/end|range, page, pageSize
-    POST /api/reports/daily/   multipart: date?, note?, project?, files[] (photos/videos)"""
+    POST /api/reports/daily/   multipart: date?, note?, project?, files[] (photos/videos/PDF/ZIP)"""
 
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
@@ -601,7 +601,7 @@ class DailyReportListCreateView(ReportsAPIView):
         files = request.FILES.getlist("files") or request.FILES.getlist("files[]") or request.FILES.getlist("file")
         note = d.get("note", "")
         if not note and not files:
-            return Response({"error": "Add a note or upload a photo/video first."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "Add a note or upload a photo, video, PDF or ZIP first."}, status=status.HTTP_400_BAD_REQUEST)
         if len(files) > MAX_DAILY_FILES:
             return Response({"error": f"You can attach at most {MAX_DAILY_FILES} files per report."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -646,7 +646,7 @@ class DailyReportListCreateView(ReportsAPIView):
             if type(exc).__module__.startswith("cloudinary"):
                 reason = f" ({str(exc)[:200]})"  # e.g. "File size too large. Maximum is 10485760"
             return Response(
-                {"error": f"The file server could not save your photo/video{reason}. Nothing was submitted — please try again."},
+                {"error": f"The file server could not save your file{reason}. Nothing was submitted — please try again."},
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
@@ -705,7 +705,7 @@ class DailyReportBulkDeleteView(ReportsAPIView):
 
 
 class DailyReportFileView(ReportsAPIView):
-    """GET /api/reports/daily/files/<id>/ — streams a photo/video to the owner
+    """GET /api/reports/daily/files/<id>/ — streams a photo/video/PDF/ZIP to the owner
     or a full-access user. Served through the API (not /media/) so it needs a
     valid token, unlike the rest of MEDIA_URL."""
 

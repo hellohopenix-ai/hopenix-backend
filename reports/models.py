@@ -97,7 +97,11 @@ def daily_report_file_path(instance, filename):
     report = instance.report
     # Videos get their own ".../video/" folder: the Cloudinary storage decides
     # image-vs-video upload from that folder (see reports/cloud_storage.py).
-    folder = "video/" if getattr(instance, "kind", "") == "video" else ""
+    # ZIPs go under ".../raw/" for the same reason (Cloudinary only accepts a
+    # non-image/non-video file as a "raw" resource). PDFs stay plain: Cloudinary
+    # stores them as "image" resources, same as everywhere else in this app.
+    kind = getattr(instance, "kind", "")
+    folder = "video/" if kind == "video" else "raw/" if kind == "zip" else ""
     # FIX (uploads from phones / other browsers failed with a 500): gallery
     # names like "WhatsApp Video 2026-09-29 at 10.15.32 AM.mp4" or
     # "IMG #1 (2).jpg" made the stored path longer than the old 100-char
@@ -157,7 +161,7 @@ class DailyReportFile(models.Model):
     original_name = models.CharField(max_length=255)
     content_type = models.CharField(max_length=100, blank=True, default="")
     size = models.PositiveBigIntegerField(default=0)
-    kind = models.CharField(max_length=10, default="image")  # image | video
+    kind = models.CharField(max_length=10, default="image")  # image | video | pdf | zip
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

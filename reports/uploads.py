@@ -1,4 +1,4 @@
-"""Validation for daily-report photo/video uploads.
+"""Validation for daily-report photo / video / PDF / ZIP uploads.
 
 The browser-supplied Content-Type (and the file extension) are trivially
 faked, so the real type is decided from the file's own first bytes. Only
@@ -13,9 +13,20 @@ IMAGE_TYPES = {
 HEIC_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1", b"heif"}
 
 
-def sniff(head: bytes):
-    """Return (kind, content_type) — kind is "image" or "video" — or None if
-    the bytes aren't a supported photo/video."""
+ZIP_MAGICS = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+
+
+def sniff(head: bytes, name: str = ""):
+    """Return (kind, content_type) — kind is "image", "video", "pdf" or "zip" —
+    or None if the bytes aren't a supported file.
+
+    PDF is recognised by its "%PDF-" header. ZIP by the "PK" header AND a
+    ".zip" file name: Word/Excel/APK/JAR files are zip containers too, so the
+    name is what keeps those out (they are not accepted here)."""
+    if head.startswith(b"%PDF-"):
+        return "pdf", "application/pdf"
+    if head[:4] in ZIP_MAGICS and str(name or "").lower().endswith(".zip"):
+        return "zip", "application/zip"
     if head.startswith(b"\xff\xd8\xff"):
         return "image", IMAGE_TYPES["jpeg"]
     if head.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -52,7 +63,10 @@ def validate_upload(uploaded, max_bytes):
     uploaded.seek(0)
     head = uploaded.read(16)
     uploaded.seek(0)
-    found = sniff(head)
+    found = sniff(head, uploaded.name)
     if not found:
-        raise ValueError(f"“{uploaded.name}” isn't a supported photo or video (JPG, PNG, WebP, GIF, HEIC, MP4, MOV, WebM).")
+        raise ValueError(
+            f"“{uploaded.name}” isn't supported. Allowed: photos (JPG, PNG, WebP, GIF, HEIC), "
+            "videos (MP4, MOV, WebM), PDF and ZIP."
+        )
     return found

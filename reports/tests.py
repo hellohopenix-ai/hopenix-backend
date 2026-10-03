@@ -24,6 +24,8 @@ MEDIA = tempfile.mkdtemp(prefix="hopenix_reports_test_")
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 MP4 = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64
+PDF = b"%PDF-1.4\n" + b"0" * 64
+ZIP = b"PK\x03\x04" + b"\x00" * 64
 
 
 def make_user(email, role="employee", name=None, status="approved", **extra):
@@ -407,6 +409,28 @@ class DailyReportTests(ReportsTestBase):
         self.assertEqual(log.user, self.ali)
         self.assertEqual(log.metadata["files"], ["a.jpg", "b.mp4"])
 
+    def test_submit_with_pdf_and_zip(self):
+        r = self.upload(self.ali_c, [self.f("plan.pdf", PDF, "application/pdf"), self.f("src.zip", ZIP, "application/zip")])
+        self.assertEqual(r.status_code, 201, r.content)
+        files = {x["name"]: x for x in r.json()["files"]}
+        self.assertEqual(files["plan.pdf"]["kind"], "pdf")
+        self.assertEqual(files["plan.pdf"]["type"], "application/pdf")
+        self.assertEqual(files["src.zip"]["kind"], "zip")
+        # saved in the database and downloadable by the owner + admin only
+        self.assertEqual(DailyReportFile.objects.filter(kind__in=["pdf", "zip"]).count(), 2)
+        self.assertIn("/raw/", DailyReportFile.objects.get(kind="zip").file.name)
+        url = files["src.zip"]["url"]
+        self.assertEqual(b"".join(self.ali_c.get(url).streaming_content), ZIP)
+        self.assertEqual(self.a.get(url).status_code, 200)
+        self.assertEqual(self.sara_c.get(url).status_code, 404)
+
+    def test_pdf_zip_only_when_really_pdf_zip(self):
+        # wrong bytes behind a .pdf / .zip name, and Office files (zip containers) are refused
+        self.assertEqual(self.upload(self.ali_c, [self.f("fake.pdf", b"<html>not a pdf</html>" + b"x" * 40, "application/pdf")]).status_code, 400)
+        self.assertEqual(self.upload(self.ali_c, [self.f("fake.zip", b"just text, no zip header at all", "application/zip")]).status_code, 400)
+        self.assertEqual(self.upload(self.ali_c, [self.f("report.docx", ZIP, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")]).status_code, 400)
+        self.assertFalse(DailyReport.objects.exists())
+
     def test_rejects_disguised_and_dangerous_files(self):
         self.assertEqual(self.upload(self.ali_c, [self.f("evil.jpg", b"<?php system($_GET[1]); ?>" + b"x" * 40, "image/jpeg")]).status_code, 400)
         self.assertEqual(self.upload(self.ali_c, [self.f("x.svg", b"<svg onload=alert(1)></svg>", "image/svg+xml")]).status_code, 400)
@@ -540,6 +564,10 @@ class SniffTests(TestCase):
         self.assertEqual(sniff(b"\x00\x00\x00\x18ftypheic")[0], "image")
         self.assertIsNone(sniff(b"<svg xmlns=..."))
         self.assertIsNone(sniff(b"MZ\x90\x00"))
+        self.assertEqual(sniff(PDF), ("pdf", "application/pdf"))
+        self.assertEqual(sniff(ZIP, "src.zip"), ("zip", "application/zip"))
+        self.assertIsNone(sniff(ZIP, "doc.docx"))   # Office files are zip containers — not accepted
+        self.assertIsNone(sniff(ZIP))               # no name -> not accepted as a zip
 
 
 class FallbackMiddlewareTests(ReportsTestBase):
