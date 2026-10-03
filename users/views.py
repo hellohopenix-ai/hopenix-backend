@@ -432,7 +432,7 @@ class AdminUpdateProfileView(APIView):
     via CompleteProfileView."""
 
     permission_classes = [IsAdmin]
-    ALLOWED_FIELDS = {"salary", "bank_name", "account_title", "account_number", "iban", "branch_code"}
+    ALLOWED_FIELDS = {"salary", "pay_type", "bank_name", "account_title", "account_number", "iban", "branch_code"}
 
     def patch(self, request, user_id):
         try:

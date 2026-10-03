@@ -57,6 +57,10 @@ class UserSerializer(serializers.ModelSerializer):
 
     # Admin-set compensation — see AdminUpdateProfileView / handleModalSalaryUpdate.
     salary = serializers.DecimalField(source="profile.salary", max_digits=12, decimal_places=2, read_only=True, default=None)
+    # How this person is paid ("salary" or "per_project") and, for per-project
+    # people, the running total of all commissions assigned to them.
+    payType = serializers.CharField(source="profile.pay_type", read_only=True, default="salary")
+    commissionTotal = serializers.SerializerMethodField()
 
     cvFileName = serializers.SerializerMethodField()
     cvDataUrl = serializers.SerializerMethodField()
@@ -78,9 +82,14 @@ class UserSerializer(serializers.ModelSerializer):
             "emergencyContact", "currentAddress", "permanentAddress", "city", "country",
             "education", "totalExperience", "experience", "workTypes", "languages",
             "programmingLanguages", "skills",
-            "bankName", "accountTitle", "accountNumber", "iban", "branchCode", "salary",
+            "bankName", "accountTitle", "accountNumber", "iban", "branchCode", "salary", "payType", "commissionTotal",
             "cvFileName", "cvDataUrl", "idFrontUrl", "idBackUrl",
         ]
+
+    def get_commissionTotal(self, obj):
+        from django.db.models import Sum
+        total = obj.commissions.aggregate(t=Sum("amount"))["t"]
+        return float(total or 0)
 
     def get_profileCompleted(self, obj):
         return hasattr(obj, "profile")
@@ -233,7 +242,7 @@ class ProfileSerializer(serializers.ModelSerializer):
             "languages", "programming_languages", "skills", "cv_file", "profile_photo",
             "id_card_front", "id_card_back",
             "bank_name", "account_title", "account_number", "iban", "branch_code",
-            "salary",
+            "salary", "pay_type",
         ]
         extra_kwargs = {
             "cv_file": {"required": False},  # required only on first submission — enforced in the view
@@ -241,6 +250,7 @@ class ProfileSerializer(serializers.ModelSerializer):
             "id_card_front": {"required": False},
             "id_card_back": {"required": False},
             "salary": {"required": False},
+            "pay_type": {"required": False},
         }
 
     def validate_phone(self, value):

@@ -6,10 +6,17 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Announcement, EmployeeExtra, Holiday, LeaveRequest
+from decimal import Decimal, InvalidOperation
+
+from projects.models import Project
+from tasks.models import Task
+from users.access import role_category
+
+from .models import Announcement, EmployeeCommission, EmployeeExtra, Holiday, LeaveRequest
 from .permissions import IsAdmin, IsStaff, can_manage_leave_request, is_admin
 from .serializers import (
     AnnouncementSerializer,
+    EmployeeCommissionSerializer,
     EmployeeSerializer,
     HolidaySerializer,
     LeaveRequestSerializer,
@@ -374,3 +381,153 @@ class AnnouncementSeenView(APIView):
             announcement.seen_by = seen_by
             announcement.save(update_fields=["seen_by"])
         return Response(AnnouncementSerializer(announcement, context={"request": request}).data)
+
+
+# ---------------------------------------------------------------------------
+# Per-project pay: commissions for "Per project" employees
+# ---------------------------------------------------------------------------
+
+
+def _can_manage_commissions(user):
+    """Admin and managers are the people who assign projects / tasks, so
+    they are the ones who can set (and see) the commission on them."""
+    if not (user and user.is_authenticated):
+        return False
+    return is_admin(user) or role_category(getattr(user, "role", None)) == "manager"
+
+
+class PayTypesView(APIView):
+    """GET /api/employees/pay-types/  -> { perProjectIds: [user ids] }
+    Which employees are paid per project. The Projects / Tasks assign
+    popups use this to show the commission box only for those people.
+    Admin / manager only; everyone else just gets an empty list."""
+
+    permission_classes = [IsStaff]
+
+    def get(self, request):
+        if not _can_manage_commissions(request.user):
+            return Response({"perProjectIds": []})
+        ids = list(
+            User.objects.filter(profile__pay_type="per_project").values_list("id", flat=True)
+        )
+        return Response({"perProjectIds": ids})
+
+
+class EmployeeCommissionListView(APIView):
+    """GET  /api/employees/commissions/?employee=<id>&task=<id>&project=<id>
+         Admin / manager: any employee's rows. Everyone else: only their own.
+         `project` returns only the project-level rows (not task rows).
+    POST /api/employees/commissions/
+         { employee, task? | project?, amount, note? }
+         Admin / manager only. Creates or updates the commission this
+         employee gets for that task / project; amount 0 removes it.
+         Only employees whose pay type is "Per project" can get one."""
+
+    permission_classes = [IsStaff]
+
+    def get(self, request):
+        user = request.user
+        qs = EmployeeCommission.objects.select_related("task", "project")
+        if _can_manage_commissions(user):
+            employee = request.query_params.get("employee")
+            if employee:
+                try:
+                    qs = qs.filter(employee_id=int(employee))
+                except (TypeError, ValueError):
+                    return Response({"error": "Invalid employee."}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            qs = qs.filter(employee=user)
+
+        task = request.query_params.get("task")
+        project = request.query_params.get("project")
+        try:
+            if task:
+                qs = qs.filter(task_id=int(task))
+            if project:
+                qs = qs.filter(project_id=int(project), task__isnull=True)
+        except (TypeError, ValueError):
+            return Response({"error": "Invalid task or project."}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(EmployeeCommissionSerializer(qs, many=True).data)
+
+    def post(self, request):
+        if not _can_manage_commissions(request.user):
+            return Response({"error": "Only an admin or manager can set commissions."}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            employee = User.objects.get(id=int(request.data.get("employee")))
+        except (TypeError, ValueError, User.DoesNotExist):
+            return Response({"error": "Employee not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        profile = getattr(employee, "profile", None)
+        if not profile or profile.pay_type != "per_project":
+            return Response(
+                {"error": f"{employee.name} is on a monthly salary, not per project."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            amount = Decimal(str(request.data.get("amount")).strip())
+        except (InvalidOperation, AttributeError):
+            return Response({"error": "Amount must be a number."}, status=status.HTTP_400_BAD_REQUEST)
+        if not amount.is_finite() or amount < 0 or amount >= Decimal("10000000000"):
+            return Response({"error": "Amount must be 0 or more."}, status=status.HTTP_400_BAD_REQUEST)
+        amount = amount.quantize(Decimal("0.01"))
+
+        task_id = request.data.get("task")
+        project_id = request.data.get("project")
+        try:
+            task_id = int(task_id) if task_id not in (None, "") else None
+            project_id = int(project_id) if project_id not in (None, "") else None
+        except (TypeError, ValueError):
+            return Response({"error": "Invalid task or project."}, status=status.HTTP_400_BAD_REQUEST)
+        task = project = None
+        if task_id is not None:
+            task = get_object_or_404(Task, id=task_id)
+            lookup = {"employee": employee, "task": task}
+            label = task.title
+        elif project_id is not None:
+            project = get_object_or_404(Project, id=project_id)
+            lookup = {"employee": employee, "project": project, "task__isnull": True}
+            label = project.name
+        else:
+            return Response({"error": "Pick a task or a project."}, status=status.HTTP_400_BAD_REQUEST)
+
+        existing = EmployeeCommission.objects.filter(**lookup).first()
+
+        if amount == 0:
+            if existing:
+                existing.delete()
+            return Response({"deleted": True})
+
+        note = request.data.get("note")
+        if existing:
+            existing.amount = amount
+            existing.label = label
+            if note is not None:
+                existing.note = str(note)[:255]
+            existing.save()
+            row = existing
+        else:
+            row = EmployeeCommission.objects.create(
+                employee=employee,
+                task=task,
+                project=project,
+                label=label,
+                amount=amount,
+                note=str(note or "")[:255],
+                created_by=request.user,
+            )
+        return Response(EmployeeCommissionSerializer(row).data, status=status.HTTP_200_OK)
+
+
+class EmployeeCommissionDeleteView(APIView):
+    """DELETE /api/employees/commissions/<id>/  — admin only. Lets an admin
+    clear an old entry (e.g. one whose project/task was already deleted)."""
+
+    permission_classes = [IsAdmin]
+
+    def delete(self, request, commission_id):
+        row = get_object_or_404(EmployeeCommission, id=commission_id)
+        row.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)

@@ -165,3 +165,50 @@ class Announcement(models.Model):
 
     def __str__(self):
         return f"{self.type} -> {self.employee_id}"
+
+
+class EmployeeCommission(models.Model):
+    """Money earned by a "Per project" employee (users.Profile.pay_type ==
+    "per_project") for ONE project or ONE task they were assigned.
+
+    Set from the Projects / Tasks assign popups, summed up on the
+    Employees page and Users page. `label` keeps the project/task name so
+    the history still reads correctly if that project/task is deleted
+    later (project/task then become NULL, the row itself stays).
+    Exactly one of `task` / `project` is normally set: a task row is
+    unique per (employee, task), a project row per (employee, project)."""
+
+    employee = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="commissions")
+    project = models.ForeignKey(
+        "projects.Project", null=True, blank=True, on_delete=models.SET_NULL, related_name="commissions"
+    )
+    task = models.ForeignKey(
+        "tasks.Task", null=True, blank=True, on_delete=models.SET_NULL, related_name="commissions"
+    )
+    label = models.CharField(max_length=255, blank=True, default="")
+    amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    note = models.CharField(max_length=255, blank=True, default="")
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["employee", "task"],
+                condition=models.Q(task__isnull=False),
+                name="uniq_commission_employee_task",
+            ),
+            models.UniqueConstraint(
+                fields=["employee", "project"],
+                condition=models.Q(task__isnull=True, project__isnull=False),
+                name="uniq_commission_employee_project",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.employee_id}: {self.amount} ({self.label})"

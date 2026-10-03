@@ -278,6 +278,16 @@ class Profile(models.Model):
     # (rawUser.salary / handleModalSalaryUpdate -> updateUserProfile).
     salary = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
 
+    # How this person is paid. "salary" = fixed monthly salary (the field
+    # above); "per_project" = no fixed salary, they earn a commission for
+    # each project / task they are assigned (employees.EmployeeCommission).
+    # Admin-set only, via AdminUpdateProfileView.
+    PAY_TYPE_CHOICES = [
+        ("salary", "Monthly salary"),
+        ("per_project", "Per project"),
+    ]
+    pay_type = models.CharField(max_length=20, choices=PAY_TYPE_CHOICES, default="salary")
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

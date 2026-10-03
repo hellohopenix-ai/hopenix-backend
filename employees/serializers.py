@@ -1,11 +1,11 @@
 from django.contrib.auth import get_user_model
-from django.db.models import Q
+from django.db.models import Q, Sum
 from rest_framework import serializers
 
 from projects.models import Project
 from tasks.models import Task
 
-from .models import Announcement, EmployeeExtra, Holiday, LeaveRequest
+from .models import Announcement, EmployeeCommission, EmployeeExtra, Holiday, LeaveRequest
 from .permissions import is_admin
 
 User = get_user_model()
@@ -161,6 +161,8 @@ class EmployeeSerializer(serializers.ModelSerializer):
     joined = serializers.SerializerMethodField()
     phone = serializers.SerializerMethodField()
     salary = serializers.SerializerMethodField()
+    payType = serializers.SerializerMethodField()
+    commissionTotal = serializers.SerializerMethodField()
     avatar = serializers.SerializerMethodField()
     role = serializers.SerializerMethodField()
     status = serializers.SerializerMethodField()
@@ -180,7 +182,7 @@ class EmployeeSerializer(serializers.ModelSerializer):
         fields = [
             "id", "authId", "name", "email", "department", "role", "status",
             "phone", "location", "avatar", "joined", "dateOfBirth", "rating",
-            "salary", "projectsAssigned", "projectsCompleted", "projectsRemaining",
+            "salary", "payType", "commissionTotal", "projectsAssigned", "projectsCompleted", "projectsRemaining",
             "tasks", "tasksCompleted", "tasksRemaining", "leaveRequests",
         ]
 
@@ -244,6 +246,28 @@ class EmployeeSerializer(serializers.ModelSerializer):
         profile = self._profile(obj)
         return profile.salary if profile else None
 
+    def _can_see_money(self, obj):
+        # Same rule as get_salary: only an admin, or the employee viewing
+        # their own row, may see pay information.
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        is_self = bool(user and user.is_authenticated and user.pk == obj.pk)
+        return is_self or is_admin(user)
+
+    def get_payType(self, obj):
+        if not self._can_see_money(obj):
+            return None
+        profile = self._profile(obj)
+        return profile.pay_type if profile else "salary"
+
+    def get_commissionTotal(self, obj):
+        # Running total of every project/task commission assigned to this
+        # person (only meaningful for "Per project" employees).
+        if not self._can_see_money(obj):
+            return None
+        total = obj.commissions.aggregate(t=Sum("amount"))["t"]
+        return float(total or 0)
+
     def get_avatar(self, obj):
         request = self.context.get("request")
         profile = self._profile(obj)
@@ -293,3 +317,33 @@ class EmployeeSerializer(serializers.ModelSerializer):
     def get_tasksRemaining(self, obj):
         total, done = self._task_stats(obj)
         return max(0, total - done)
+
+
+class EmployeeCommissionSerializer(serializers.ModelSerializer):
+    """One row of a per-project employee's earnings breakdown (what the
+    Employees page / Users page list under their pay)."""
+
+    employeeId = serializers.IntegerField(source="employee_id", read_only=True)
+    projectId = serializers.IntegerField(source="project_id", read_only=True)
+    taskId = serializers.IntegerField(source="task_id", read_only=True)
+    kind = serializers.SerializerMethodField()
+    status = serializers.SerializerMethodField()
+    amount = serializers.SerializerMethodField()
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        model = EmployeeCommission
+        fields = ["id", "employeeId", "projectId", "taskId", "kind", "label", "amount", "note", "status", "createdAt"]
+
+    def get_kind(self, obj):
+        return "task" if obj.task_id else "project"
+
+    def get_status(self, obj):
+        if obj.task_id and obj.task:
+            return obj.task.status
+        if obj.project_id and obj.project:
+            return obj.project.status
+        return ""
+
+    def get_amount(self, obj):
+        return float(obj.amount or 0)

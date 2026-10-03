@@ -20,6 +20,10 @@ urlpatterns = [
     path("holidays/", views.HolidayListCreateView.as_view(), name="holiday-list"),
     path("holidays/<int:holiday_id>/", views.HolidayDeleteView.as_view(), name="holiday-delete"),
 
+    path("pay-types/", views.PayTypesView.as_view(), name="pay-types"),
+    path("commissions/", views.EmployeeCommissionListView.as_view(), name="commission-list"),
+    path("commissions/<int:commission_id>/", views.EmployeeCommissionDeleteView.as_view(), name="commission-delete"),
+
     path("announcements/", views.AnnouncementListCreateView.as_view(), name="announcement-list"),
     path("announcements/<int:announcement_id>/", views.AnnouncementDeleteView.as_view(), name="announcement-delete"),
     path("announcements/<int:announcement_id>/seen/", views.AnnouncementSeenView.as_view(), name="announcement-seen"),
