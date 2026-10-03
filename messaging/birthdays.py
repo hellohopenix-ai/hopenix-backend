@@ -1,9 +1,14 @@
 """Birthday notifications (phone + laptop, also when the site is closed).
 
-Runs once a day from 08:00 local time (MEETING_TIME_ZONE, default
-Asia/Karachi), driven by the same background loop as the meeting reminders
-(meetings/reminders.py). Each birthday is announced once per year
+Sent at 12:00 AM (midnight) on the birthday itself, driven by the same
+background loop as the meeting reminders (meetings/reminders.py), so it lands
+within a minute of midnight. Each birthday is announced once per year
 (messaging.BirthdayNotice).
+
+  * Employees (and the team notified about them): 12:00 AM Pakistan time
+    (MEETING_TIME_ZONE, default Asia/Karachi).
+  * Clients: 12:00 AM in the client's OWN country (Client.country_code /
+    Client.country -> messaging/country_timezones.py); no country -> Pakistan.
 
   * Employee birthday -> the birthday person gets "Happy Birthday", everybody
     else on the team (not clients) gets "Today is <name>'s birthday".
@@ -21,12 +26,16 @@ from django.contrib.auth import get_user_model
 from django.db import IntegrityError
 from django.db.models import Q
 
+from .country_timezones import COUNTRY_CODE_BY_NAME, COUNTRY_TIMEZONES, DEFAULT_TIMEZONE
 from .models import BirthdayNotice
 from .push_utils import notify_user
 
 logger = logging.getLogger(__name__)
 
-SEND_FROM_HOUR = 8
+# Midnight: the pass runs every minute and each birthday is claimed once, so
+# it goes out in the first minute after 12:00 AM (or as soon as the server is
+# back up, later that same day, if it was down at midnight).
+SEND_FROM_HOUR = 0
 
 
 def _now():
@@ -89,15 +98,43 @@ def _team_birthdays(today):
                 logger.exception("Birthday notify failed for user %s", colleague.id)
 
 
-def _client_birthdays(today):
+def _client_tz(client):
+    """The client's own timezone, from their country (code first, then name)."""
+    code = (getattr(client, "country_code", "") or "").strip().upper()
+    if code not in COUNTRY_TIMEZONES:
+        code = COUNTRY_CODE_BY_NAME.get((getattr(client, "country", "") or "").strip().lower(), "")
+    return ZoneInfo(COUNTRY_TIMEZONES.get(code, DEFAULT_TIMEZONE))
+
+
+def _is_birthday_on(dob, day):
+    """dob falls on `day` (29 Feb is celebrated on 28 Feb in non-leap years)."""
+    if dob.month == day.month and dob.day == day.day:
+        return True
+    return dob.month == 2 and dob.day == 29 and day.month == 2 and day.day == 28 and not calendar.isleap(day.year)
+
+
+def _client_birthdays(_unused_today=None):
+    from datetime import timedelta, timezone as dt_timezone
+
     from dashboard.models import Client
 
     User = get_user_model()
-    clients = Client.objects.filter(_birthday_q("date_of_birth", today), status="active").select_related(
-        "manager", "portal_user"
-    )
+    # Timezones differ per client, so "today" is worked out per client. Only
+    # clients whose birthday is within a day of UTC-today can possibly match
+    # (every timezone is within +-1 calendar day of UTC) - keeps this cheap.
+    utc_today = datetime.now(dt_timezone.utc).date()
+    window = Q()
+    for offset in (-1, 0, 1):
+        window |= _birthday_q("date_of_birth", utc_today + timedelta(days=offset))
+    clients = Client.objects.filter(window, status="active").select_related("manager", "portal_user")
     for client in clients:
-        if not _claim("client", client.id, today.year):
+        local_now = datetime.now(_client_tz(client))
+        if local_now.hour < SEND_FROM_HOUR:
+            continue
+        local_today = local_now.date()
+        if not _is_birthday_on(client.date_of_birth, local_today):
+            continue
+        if not _claim("client", client.id, local_today.year):
             continue
         who = client.contact_person or client.name
         label = f"{who} ({client.name})" if client.contact_person and client.name else who
