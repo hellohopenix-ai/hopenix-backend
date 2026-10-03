@@ -273,11 +273,31 @@ CORS_ALLOW_HEADERS = [
     'x-requested-with',
 ]
 
-EMAIL_BACKEND = 'anymail.backends.resend.EmailBackend'
-ANYMAIL = {
-    'RESEND_API_KEY': config('RESEND_API_KEY', default=''),
-}
-DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='onboarding@resend.dev')
+# Which service sends the emails (invites, OTP codes, password reset):
+#   EMAIL_PROVIDER=resend  (default) -> needs a VERIFIED domain in Resend and
+#                           DEFAULT_FROM_EMAIL on that domain. Use this once the
+#                           company domain is live.
+#   EMAIL_PROVIDER=gmail   -> sends through the Gmail account in EMAIL_HOST_USER
+#                           using a Google "App Password" in EMAIL_HOST_PASSWORD.
+#                           Works for any recipient, no domain needed.
+EMAIL_PROVIDER = config('EMAIL_PROVIDER', default='resend').strip().lower()
+EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')
+EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='').replace(' ', '')
+
+if EMAIL_PROVIDER == 'gmail':
+    EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+    EMAIL_HOST = 'smtp.gmail.com'
+    EMAIL_PORT = 587
+    EMAIL_USE_TLS = True
+    EMAIL_TIMEOUT = 15
+    # Gmail always sends "From" the logged-in account, so use that address.
+    DEFAULT_FROM_EMAIL = f'Hopenix <{EMAIL_HOST_USER}>' if EMAIL_HOST_USER else 'hello.hopenix@gmail.com'
+else:
+    EMAIL_BACKEND = 'anymail.backends.resend.EmailBackend'
+    ANYMAIL = {
+        'RESEND_API_KEY': config('RESEND_API_KEY', default=''),
+    }
+    DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='onboarding@resend.dev')
 
 # Where Client Portal support-form submissions get emailed
 # (dashboard.views.SupportRequestView). Falls back to EMAIL_HOST_USER if unset.
