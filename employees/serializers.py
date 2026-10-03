@@ -6,6 +6,7 @@ from projects.models import Project
 from tasks.models import Task
 
 from .models import Announcement, EmployeeCommission, EmployeeExtra, Holiday, LeaveRequest
+from .commission_utils import commission_state, counted_total_for
 from .permissions import is_admin
 
 User = get_user_model()
@@ -265,8 +266,9 @@ class EmployeeSerializer(serializers.ModelSerializer):
         # person (only meaningful for "Per project" employees).
         if not self._can_see_money(obj):
             return None
-        total = obj.commissions.aggregate(t=Sum("amount"))["t"]
-        return float(total or 0)
+        # Only COMPLETED, still-existing, non-deactivated projects/tasks
+        # count (see commission_utils.counted_q).
+        return counted_total_for(obj)
 
     def get_avatar(self, obj):
         request = self.context.get("request")
@@ -321,29 +323,49 @@ class EmployeeSerializer(serializers.ModelSerializer):
 
 class EmployeeCommissionSerializer(serializers.ModelSerializer):
     """One row of a per-project employee's earnings breakdown (what the
-    Employees page / Users page list under their pay)."""
+    Employees page / Users page list under their pay).
+
+    `state`: "counted" (project/task Completed -> included in the total),
+    "pending" (not completed yet -> NOT in the total) or "removed"
+    (project/task deleted or deactivated -> NOT in the total, row shows
+    `stateNote`)."""
 
     employeeId = serializers.IntegerField(source="employee_id", read_only=True)
     projectId = serializers.IntegerField(source="project_id", read_only=True)
     taskId = serializers.IntegerField(source="task_id", read_only=True)
     kind = serializers.SerializerMethodField()
     status = serializers.SerializerMethodField()
+    state = serializers.SerializerMethodField()
+    stateNote = serializers.SerializerMethodField()
+    counted = serializers.SerializerMethodField()
     amount = serializers.SerializerMethodField()
     createdAt = serializers.DateTimeField(source="created_at", read_only=True)
 
     class Meta:
         model = EmployeeCommission
-        fields = ["id", "employeeId", "projectId", "taskId", "kind", "label", "amount", "note", "status", "createdAt"]
+        fields = [
+            "id", "employeeId", "projectId", "taskId", "kind", "label", "amount", "note",
+            "status", "state", "stateNote", "counted", "createdAt",
+        ]
 
     def get_kind(self, obj):
         return "task" if obj.task_id else "project"
 
     def get_status(self, obj):
-        if obj.task_id and obj.task:
-            return obj.task.status
-        if obj.project_id and obj.project:
-            return obj.project.status
-        return ""
+        state, label = commission_state(obj)
+        if state == "removed":
+            return "Removed"
+        return label
+
+    def get_state(self, obj):
+        return commission_state(obj)[0]
+
+    def get_stateNote(self, obj):
+        state, label = commission_state(obj)
+        return label if state == "removed" else ""
+
+    def get_counted(self, obj):
+        return commission_state(obj)[0] == "counted"
 
     def get_amount(self, obj):
         return float(obj.amount or 0)

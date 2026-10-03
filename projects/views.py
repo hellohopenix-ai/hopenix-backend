@@ -254,6 +254,31 @@ class ProjectViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         return ProjectListSerializer if self.action == "list" else ProjectDetailSerializer
 
+    def create(self, request, *args, **kwargs):
+        # Double-click / retry guard: the same person creating a project
+        # with the same name within a few seconds is the same click sent
+        # twice, not a second project. Return the one already saved
+        # instead of creating 2-3 copies (each of which also used to get
+        # its own commission, so pay was counted several times).
+        name = str((request.data.get("name") if hasattr(request.data, "get") else "") or "").strip()
+        if name:
+            recent = (
+                Project.objects.filter(
+                    created_by=request.user,
+                    name__iexact=name,
+                    is_archived=False,
+                    created_at__gte=timezone.now() - timedelta(seconds=20),
+                )
+                .order_by("-created_at")
+                .first()
+            )
+            if recent is not None:
+                return Response(
+                    ProjectDetailSerializer(recent, context=self.get_serializer_context()).data,
+                    status=status.HTTP_200_OK,
+                )
+        return super().create(request, *args, **kwargs)
+
     def perform_create(self, serializer):
         project = serializer.save(created_by=self.request.user)
         self._notify_project_people(project, set())

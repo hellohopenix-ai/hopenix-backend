@@ -87,9 +87,9 @@ class UserSerializer(serializers.ModelSerializer):
         ]
 
     def get_commissionTotal(self, obj):
-        from django.db.models import Sum
-        total = obj.commissions.aggregate(t=Sum("amount"))["t"]
-        return float(total or 0)
+        # Only COMPLETED, still-existing, non-deactivated projects/tasks count.
+        from employees.commission_utils import counted_total_for
+        return counted_total_for(obj)
 
     def get_profileCompleted(self, obj):
         return hasattr(obj, "profile")
