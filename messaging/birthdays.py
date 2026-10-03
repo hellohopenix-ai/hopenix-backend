@@ -5,13 +5,13 @@ background loop as the meeting reminders (meetings/reminders.py), so it lands
 within a minute of midnight. Each birthday is announced once per year
 (messaging.BirthdayNotice).
 
-  * Employees (and the team notified about them): 12:00 AM Pakistan time
-    (MEETING_TIME_ZONE, default Asia/Karachi).
+  * Employees: 12:00 AM Pakistan time (MEETING_TIME_ZONE, default
+    Asia/Karachi). The birthday person gets "Happy Birthday"; ONLY the admin(s)
+    and that person's own manager are told "Today is <name>'s birthday" - the
+    rest of the team is not notified.
   * Clients: 12:00 AM in the client's OWN country (Client.country_code /
     Client.country -> messaging/country_timezones.py); no country -> Pakistan.
 
-  * Employee birthday -> the birthday person gets "Happy Birthday", everybody
-    else on the team (not clients) gets "Today is <name>'s birthday".
   * Client birthday   -> every admin and that client's assigned manager get
     "Today is <client>'s birthday"; if the client has a portal login they get
     a "Happy Birthday" of their own.
@@ -83,8 +83,9 @@ def _team_birthdays(today):
             "title": f"🎂 Happy Birthday, {_first(person.name)}!",
             "body": "Everyone at Hopenix wishes you a wonderful day.",
         })
-        colleagues = (
-            User.objects.filter(is_active=True, status="approved").exclude(role="client").exclude(id=person.id)
+        # Only the admin(s) and this person's own manager - not the whole team.
+        colleagues = User.objects.filter(is_active=True, status="approved").exclude(id=person.id).filter(
+            Q(role="admin") | Q(id=person.manager_id)
         )
         for colleague in colleagues:
             try:
