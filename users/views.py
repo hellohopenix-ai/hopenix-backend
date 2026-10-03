@@ -445,7 +445,12 @@ class AdminUpdateProfileView(APIView):
     via CompleteProfileView."""
 
     permission_classes = [IsAdmin]
-    ALLOWED_FIELDS = {"salary", "pay_type", "bank_name", "account_title", "account_number", "iban", "branch_code"}
+    ALLOWED_FIELDS = {
+        "salary", "pay_type", "bank_name", "account_title", "account_number", "iban", "branch_code",
+        # Personal / contact details an admin may correct from the Users page.
+        "father_name", "dob", "gender", "marital_status", "phone", "cnic", "emergency_contact",
+        "current_address", "permanent_address", "city", "country",
+    }
 
     def patch(self, request, user_id):
         try:
@@ -460,6 +465,11 @@ class AdminUpdateProfileView(APIView):
         data = {k: v for k, v in request.data.items() if k in self.ALLOWED_FIELDS}
         if not data:
             return Response({"error": "No editable fields were provided."}, status=status.HTTP_400_BAD_REQUEST)
+        # cnic / dob are nullable: an emptied box must be stored as NULL (an
+        # empty string would break the unique CNIC rule for a second blank).
+        for nullable in ("cnic", "dob"):
+            if nullable in data and (data[nullable] is None or str(data[nullable]).strip() == ""):
+                data[nullable] = None
 
         serializer = ProfileSerializer(profile, data=data, partial=True)
         serializer.is_valid(raise_exception=True)
