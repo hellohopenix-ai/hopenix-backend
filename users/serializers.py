@@ -77,7 +77,7 @@ class UserSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             "id", "name", "email", "company", "role", "department", "status",
-            "date_joined", "profileCompleted", "managerId", "managerName", "avatar", "registrationPhoto", "updated_at",
+            "date_joined", "last_login", "profileCompleted", "managerId", "managerName", "avatar", "registrationPhoto", "updated_at",
             "fatherName", "dob", "dateOfBirth", "gender", "maritalStatus", "phone", "cnic",
             "emergencyContact", "currentAddress", "permanentAddress", "city", "country",
             "education", "totalExperience", "experience", "workTypes", "languages",

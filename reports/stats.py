@@ -40,17 +40,34 @@ def real_employees():
     return User.objects.filter(status="approved").exclude(role__in=["admin", "client"])
 
 
-def entity_stats():
+def _project_range_q(rng):
+    """Projects belong to a period by their start date (falls back to the day
+    they were created when no start date was set)."""
+    q = Q()
+    if rng is None:
+        return q
+    if rng.start:
+        q &= Q(start_date__gte=rng.start) | Q(start_date__isnull=True, created_at__gte=rng.start_dt)
+    if rng.end:
+        q &= Q(start_date__lte=rng.end) | Q(start_date__isnull=True, created_at__lt=rng.end_dt)
+    return q
+
+
+def entity_stats(rng=None):
+    """rng (optional DateRange): scope projects/tasks/clients to the selected
+    week / month / etc. Headcount stays a live total. rng=None = all time."""
     Project = apps.get_model("projects", "Project")
     Task = apps.get_model("tasks", "Task")
     Client = apps.get_model("dashboard", "Client")
 
     today = timezone.localdate()
-    projects = Project.objects.filter(is_archived=False)
+    projects = Project.objects.filter(is_archived=False).filter(_project_range_q(rng))
     totals = projects.aggregate(budget=Sum("budget"), spent=Sum("spent"))
     total_budget, total_spent = _f(totals["budget"]), _f(totals["spent"])
 
     tasks = Task.objects.all()
+    if rng is not None:
+        tasks = rng.apply_dates(tasks, field="created_on")
     total_tasks = tasks.count()
     completed_tasks = tasks.filter(status="Completed").count()
     overdue_tasks = tasks.exclude(status="Completed").filter(Q(status="Overdue") | Q(due_date__lt=today)).count()
@@ -66,18 +83,23 @@ def entity_stats():
         "totalBudget": total_budget,
         "totalSpent": total_spent,
         "netRemaining": total_budget - total_spent,
-        "activeClients": Client.objects.filter(status="active").count(),
+        "activeClients": (rng.apply(Client.objects.filter(status="active")) if rng is not None else Client.objects.filter(status="active")).count(),
     }
 
 
-def finance_stats():
+def finance_stats(rng=None):
     Sale = apps.get_model("sales", "Sale")
     Income = apps.get_model("dashboard", "Income")
     Expense = apps.get_model("expenses", "Expense")
-    sales = Sale.objects.aggregate(total=Sum("amount"), n=Count("id"))
-    paid = Sale.objects.filter(status="Paid").aggregate(total=Sum("amount"))["total"]
-    income = Income.objects.filter(status="Received").aggregate(total=Sum("amount"), n=Count("id"))
-    expenses = Expense.objects.filter(status="Approved").aggregate(total=Sum("amount"), n=Count("id"))
+
+    def scoped(qs):
+        return rng.apply_dates(qs) if rng is not None else qs
+
+    sales_qs = scoped(Sale.objects.all())
+    sales = sales_qs.aggregate(total=Sum("amount"), n=Count("id"))
+    paid = sales_qs.filter(status="Paid").aggregate(total=Sum("amount"))["total"]
+    income = scoped(Income.objects.filter(status="Received")).aggregate(total=Sum("amount"), n=Count("id"))
+    expenses = scoped(Expense.objects.filter(status="Approved")).aggregate(total=Sum("amount"), n=Count("id"))
     return {
         "salesCount": sales["n"] or 0,
         "salesTotal": _f(sales["total"]),
@@ -89,9 +111,11 @@ def finance_stats():
     }
 
 
-def chart_data():
+def chart_data(rng=None):
     Project = apps.get_model("projects", "Project")
-    projects = list(Project.objects.filter(is_archived=False).order_by("-budget", "name"))
+    projects = list(
+        Project.objects.filter(is_archived=False).filter(_project_range_q(rng)).order_by("-budget", "name")
+    )
 
     by_status = defaultdict(int)
     for p in projects:

@@ -119,6 +119,8 @@ class LoginView(APIView):
                 )
 
         user.reset_failed_login()
+        user.last_login = timezone.now()
+        user.save(update_fields=["last_login"])
         token, _ = Token.objects.get_or_create(user=user)
         log_activity(action="login", user=user, module="Auth", description="Logged in")
         return Response({"token": token.key, "user": UserSerializer(user, context={"request": request}).data})
@@ -285,6 +287,7 @@ class ApprovedUsersView(APIView):
 # ---------------------------------------------------------------------------
 from django.utils.crypto import get_random_string
 from django.core.mail import send_mail
+from urllib.parse import quote
 from .models import Profile
 
 
@@ -325,25 +328,35 @@ class InviteUserView(APIView):
             or getattr(settings, "EMAIL_HOST_USER", "")
             or "hello.hopenix@gmail.com"
         )
+        # Link in the email -> opens the website's Login page with the invited
+        # email already filled in (the page also has a "Register" link).
+        frontend = (getattr(settings, "FRONTEND_URL", "") or "").rstrip("/")
+        login_link = f"{frontend}/login?invited=1&email={quote(email)}"
+        register_link = f"{frontend}/register"
+        email_sent = False
         try:
-            send_mail(
+            email_sent = bool(send_mail(
                 subject="You've been invited to Hopenix",
                 message=(
                     f"Hi {name},\n\n"
                     f"You've been invited to join Hopenix.\n\n"
                     f"Email: {email}\n"
                     f"Temporary password: {temp_password}\n\n"
-                    f"Log in and complete your profile — an admin will approve your "
+                    f"Click here to open the website and log in:\n{login_link}\n\n"
+                    f"(New here? You can also register at: {register_link})\n\n"
+                    f"After logging in, complete your profile — an admin will approve your "
                     f"account once it's submitted."
                 ),
                 from_email=from_email,
                 recipient_list=[email],
-                fail_silently=True,
-            )
+                fail_silently=False,
+            ))
         except Exception as e:
-            print(f"[INVITE EMAIL LOG] {email}: {e}")
+            # Don't hide it any more: shows up in the server log so a bad
+            # Resend key / unverified sender domain is easy to spot.
+            print(f"[INVITE EMAIL LOG] could not send to {email}: {e}")
 
-        return Response({"success": True, "user": UserSerializer(user, context={"request": request}).data}, status=status.HTTP_201_CREATED)
+        return Response({"success": True, "emailSent": email_sent, "user": UserSerializer(user, context={"request": request}).data}, status=status.HTTP_201_CREATED)
 
 
 class SetUserStatusView(APIView):
@@ -891,6 +904,8 @@ class GoogleLoginView(APIView):
                     status=status.HTTP_401_UNAUTHORIZED,
                 )
 
+        user.last_login = timezone.now()
+        user.save(update_fields=["last_login"])
         token, _ = Token.objects.get_or_create(user=user)
         log_activity(action="login", user=user, module="Auth", description="Logged in with Google")
         return Response({"token": token.key, "user": UserSerializer(user, context={"request": request}).data})

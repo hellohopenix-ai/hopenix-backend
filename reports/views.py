@@ -335,8 +335,8 @@ class SummaryView(ReportsAPIView):
         return Response({
             "range": {"start": rng.start, "end": rng.end},
             "currency": currency_symbol().strip(),
-            "stats": {**entity_stats(), **finance_stats()},
-            "charts": chart_data(),
+            "stats": {**entity_stats(rng), **finance_stats(rng)},
+            "charts": chart_data(rng),
             "activity": activity_block(logs, rng, tz),
             "dailyReports": {
                 "total": dailies.count(),

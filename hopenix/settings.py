@@ -281,6 +281,9 @@ DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='onboarding@resend.dev
 
 # Where Client Portal support-form submissions get emailed
 # (dashboard.views.SupportRequestView). Falls back to EMAIL_HOST_USER if unset.
+# Public URL of the website — used for the link inside invite emails.
+FRONTEND_URL = config('FRONTEND_URL', default='https://hopenix-frontend.vercel.app')
+
 SUPPORT_EMAIL = config('SUPPORT_EMAIL', default='')
 
 # Web Push (VAPID) — lets a call still ring a user when their tab/browser

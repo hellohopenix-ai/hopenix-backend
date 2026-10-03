@@ -35,8 +35,8 @@ def build_catalog(request, rng):
 
     sym = currency_symbol()
     now_iso = timezone.now().isoformat()
-    stats = entity_stats()
-    fin = finance_stats()
+    stats = entity_stats(rng)
+    fin = finance_stats(rng)
 
     projects = list(Project.objects.filter(is_archived=False).select_related("client").prefetch_related("team", "modules"))
     tasks = list(Task.objects.only("assignees", "status"))
